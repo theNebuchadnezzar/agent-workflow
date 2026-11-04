@@ -184,6 +184,18 @@ python aiwf.py gate fix-login-npe          # 检查门禁（失败退出码 2）
 
 **建议**：工作数据目录一律放仓库外。仓库里只留代码和 md。
 
+### 数据目录在哪，以及"分裂"排查
+
+`AIWF_DATA` 是**环境变量**，只在设了它的终端里生效 —— 所以很容易出现"一半 story 在仓库内、一半在外部"：
+
+```bash
+python aiwf.py where     # 打印代码目录、当前数据目录、仓库内 ./stories 各自的 story
+python aiwf.py status    # 末尾会显示当前数据目录；发现分裂会提示
+python aiwf.py adopt     # 把仓库内 ./stories 搬到当前数据目录（先预览，加 --yes 执行）
+```
+
+**注意 `setx` 的坑**：`setx AIWF_DATA "<路径>"` 只对**之后新开的终端**生效，当前窗口要用 `$env:AIWF_DATA = "<路径>"`。
+
 ---
 
 ## 路线图

@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -408,9 +409,108 @@ def cmd_acs(args):
     return 0
 
 
+def _local_stories():
+    """仓库内的 ./stories（历史位置）。"""
+    return ROOT / "stories"
+
+
+def data_dir_report(verbose=False):
+    """当前数据目录、来源，以及"分裂"警告。"""
+    env = os.environ.get("AIWF_DATA", "").strip()
+    src = f"AIWF_DATA={env}" if env else "默认（仓库内 ./stories）"
+    lines = [f"数据目录  {STORY_DIR}", f"来源      {src}"]
+
+    local = _local_stories()
+    if local.exists():
+        n = len([p for p in local.iterdir() if p.is_dir()])
+        same = local.resolve() == STORY_DIR.resolve()
+        if n and not same:
+            lines.append(f"⚠ 分裂    {local} 里还有 {n} 个 story，不在当前数据目录")
+            lines.append(f"          统一：python aiwf.py adopt    # 搬到 {STORY_DIR}")
+        elif verbose:
+            lines.append(f"          仓库内 ./stories：{'同一个目录' if same else '空'}")
+    if not env and verbose:
+        lines.append('提示     想放仓库外：setx AIWF_DATA "<路径>"，然后【重开终端】')
+    return lines
+
+
+def _print_data_dir(verbose=False):
+    for ln in data_dir_report(verbose=verbose):
+        print(ln)
+
+
+def cmd_where(args):
+    """打印所有路径与统计，用来排查"文件不一样"。"""
+    _print_data_dir(verbose=True)
+    print(f"代码目录  {ROOT}")
+    print()
+    for label, p in (("当前数据目录", STORY_DIR), ("仓库内 stories", _local_stories())):
+        if p.exists():
+            ds = [d for d in p.iterdir() if d.is_dir()]
+            print(f"{label}：{p}  →  {len(ds)} 个 story")
+            for d in sorted(ds):
+                m = load_meta(d) or {}
+                print(f"    {d.name}   key={m.get('key') or '-'}  stage={m.get('stage', '?')}")
+        else:
+            print(f"{label}：{p}  →  不存在")
+    print()
+    print("如果两个地方都有 story，说明环境变量只在部分终端生效。")
+    print("统一到外部目录：setx AIWF_DATA \"<路径>\" → 重开终端 → python aiwf.py adopt")
+    return 0
+
+
+def cmd_adopt(args):
+    """把仓库内 ./stories 的 story 搬到当前数据目录。"""
+    local = _local_stories()
+    if not local.exists():
+        print(f"{local} 不存在，没有要搬的。")
+        return 0
+    if local.resolve() == STORY_DIR.resolve():
+        print(f"{local} 就是当前数据目录，不需要搬。")
+        return 0
+
+    ds = sorted([d for d in local.iterdir() if d.is_dir()])
+    if not ds:
+        print(f"{local} 里没有 story。")
+        return 0
+
+    print(f"从 {local}")
+    print(f"到 {STORY_DIR}")
+    print(f"共 {len(ds)} 个：")
+    for d in ds:
+        m = load_meta(d) or {}
+        print(f"  {d.name}   key={m.get('key') or '-'}  stage={m.get('stage', '?')}")
+
+    if not args.yes:
+        print("\n这是预览。确认后加 --yes 执行搬迁。")
+        return 0
+
+    STORY_DIR.mkdir(parents=True, exist_ok=True)
+    moved = skipped = 0
+    for d in ds:
+        target = STORY_DIR / d.name
+        if target.exists():
+            print(f"  跳过（目标已存在）：{d.name}")
+            skipped += 1
+            continue
+        shutil.move(str(d), str(target))
+        moved += 1
+    # 清掉空的 ./stories
+    try:
+        if local.exists() and not any(local.iterdir()):
+            local.rmdir()
+            print("  已删除空的 ./stories")
+    except OSError:
+        pass
+    print(f"\n完成：搬了 {moved} 个，跳过 {skipped} 个")
+    _print_data_dir()
+    return 0
+
+
 def cmd_status(args):
     if not STORY_DIR.exists():
-        print("还没有任何 story。先跑 init。")
+        print(f"数据目录 {STORY_DIR} 还不存在。先跑 init。")
+        _print_data_dir()
         return 0
     rows = []
     for d in sorted(STORY_DIR.iterdir()):
@@ -438,6 +538,8 @@ def cmd_status(args):
         print(f"{created:<12}{key:<13}{stage:<13}{last:>4}{miss:>4}{n:>4}  {label}")
     print("\nAC: 最近一次兑现检查 pass / warn(!) / block(x) / -（还没查）")
     print("缺: 还没有改动认领的验收条件数量")
+    print()
+    _print_data_dir()
     return 0
 
 
@@ -815,6 +917,13 @@ def main(argv=None):
     p.add_argument("--key", "--jira", dest="key", default="",
                    help="tracker 号：Jira SHIP-1024 / GitHub #123 / 禅道 等")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("where", help="打印数据目录与统计，排查文件不一致")
+    p.set_defaults(func=cmd_where)
+
+    p = sub.add_parser("adopt", help="把仓库内 ./stories 的 story 搬到当前数据目录")
+    p.add_argument("--yes", action="store_true", help="确认执行（默认只预览）")
+    p.set_defaults(func=cmd_adopt)
 
     p = sub.add_parser("status", help="所有进行中的 story")
     p.add_argument("--all", action="store_true", help="包含已完成")
