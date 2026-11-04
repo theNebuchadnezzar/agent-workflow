@@ -965,14 +965,24 @@ def cmd_review(args):
         print("  确认后加 --independent 重跑。")
         return 3
     meta = load_meta(d) or {}
+    # 记下「评的是哪一份代码」——否则下次说不清最新代码有没有被评过
+    commit = (args.commit or "").strip()
     data = {"ts": now(), "independent": True, "reviewer": args.reviewer or "",
-            "verdict": args.verdict, "issues": args.issue or []}
+            "verdict": args.verdict, "issues": args.issue or [],
+            "commit": commit, "range": (args.range or "").strip()}
     (d / "review.json").write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     meta["stage"] = "reviewed" if args.verdict == "pass" else "implementing"
     save_meta(d, meta)
     print(f"review  {args.verdict}  by {args.reviewer or '?'}  -> stage={meta['stage']}")
+    if commit:
+        print(f"        评审对象：{commit}" + (f"（diff {args.range}）" if args.range else ""))
+    else:
+        h = (meta.get("handoff") or {}).get("commit", "")
+        print("  提醒：没记被评审的 commit。建议加 --commit <sha>"
+              + (f"（当前 handoff 是 {h}）" if h else "")
+              + "，否则以后分不清最新代码到底评过没有。")
     if args.verdict != "pass":
         print("  -> 打回 implementing：修完后要再走一次独立 review。")
     return 0
@@ -1052,6 +1062,13 @@ def cmd_gate(args):
                 problems.append("review.json：评审不是独立的（必须换 session）")
             if r.get("verdict") != "pass":
                 problems.append(f"review.json：评审结论是 {r.get('verdict')}，不是 pass")
+            rc = (r.get("commit") or "").strip()
+            hc = ((meta.get("handoff") or {}).get("commit") or "").strip()
+            if rc and hc and not (hc.startswith(rc) or rc.startswith(hc)):
+                problems.append(f"review.json：评审的是 {rc}，但当前提交是 {hc}"
+                                "——代码变了，要重新评")
+            elif not rc:
+                hints.append("review.json 没记被评审的 commit，建议 review --commit <sha>")
 
     if problems:
         print(f"gate FAILED  ({stage})")
@@ -1164,6 +1181,8 @@ def main(argv=None):
     p.add_argument("--reviewer", default="")
     p.add_argument("--verdict", required=True, choices=["pass", "fail"])
     p.add_argument("--issue", action="append")
+    p.add_argument("--commit", default="", help="被评审的提交（HEAD sha），建议必填")
+    p.add_argument("--range", dest="range", default="", help="评审的 diff 范围，如 200c8d49..3ef42576")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("gate", help="检查当前阶段门禁")

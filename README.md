@@ -166,7 +166,8 @@ python aiwf.py ac-check fix-login-npe > ac-prompt.md   # 生成对账提示词
 python aiwf.py ac-record fix-login-npe --verdict pass --fulfilled AC-1 --fulfilled AC-2
 python aiwf.py verify fix-login-npe --cmd "mvn -q test" --result pass
 python aiwf.py review fix-login-npe --independent --reviewer reviewer-a \
-        --verdict pass --issue "异常处理建议统一包装"
+        --verdict pass --issue "异常处理建议统一包装" \
+        --commit abc1234 --range 200c8d49..abc1234   # 记住评的是哪份代码
 python aiwf.py gate fix-login-npe          # 检查门禁（失败退出码 2）
 ```
 
