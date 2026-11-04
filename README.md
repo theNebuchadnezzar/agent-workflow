@@ -117,35 +117,72 @@ python aiwf.py link fix-login-npe --target 2026-11-01T09:45:43 --criterion AC-1
 
 > 挂 AC 这个动作本身就是自我检查：**说不清挂哪条，就说明这处改动可能不该做。**
 
-### 三个真实场景的处理
+### 真实场景的处理
 
 **① 前后端分工，部分 AC 不归你**
 
-`ash
-python aiwf.py defer SHIP-1024 AC-1 AC-2 --owner frontend --reason 前端仓库另有人负责
-`
+```bash
+python aiwf.py defer SHIP-1024 AC-1 AC-2 --owner frontend --reason "前端仓库另有人负责"
+```
 
-转交的 AC 不再要求本 story 认领，gate 不再拦；cs 会标 →，c-check 提示词里也会注明「不在本 story 范围」。
-拿回来用 undefer。**这是有记录地转交，不是无痕忽略。**
+转交的 AC 不再要求本 story 认领，gate 不再拦；`acs` 会标 `→`，`ac-check` 提示词里也会注明「不在本 story 范围」。拿回来用 `undefer`。**这是有记录地转交，不是无痕忽略。**
 
 **② 需求多轮讨论，AC 结论变了**
 
 认领时会把 AC 的**文本哈希**一起记下。AC 文本一改，旧认领自动判为过期：
 
-`
+```
 x AC 文本改过了，这些旧认领已失效，需要重新 record：AC-9
-`
+```
 
-按新结论重新 
-ecord --criterion AC-9 即可恢复。**避免用旧方案当证据。**
+按新结论重新 `record --criterion AC-9` 即可恢复。**避免用旧方案当证据。**
 
 **③ 对账什么时候做**
 
-工具不能替你跑外部 agent，所以设了提醒：**自上次对账起每 3 条改动**提示一次，
+工具不能替你跑外部 agent，所以设了提醒：**自上次对账起每 3 条改动**提示一次：
 
-`ash
+```bash
 python aiwf.py ac-check SHIP-1024 > ac-prompt.md
-`
+```
+
+**④ 需求追加 / 变更：不用重开一个 story**
+
+小需求追加、AC 变更时，**不新建 story，也不重走全部流程**——用 `reopen`：
+
+```bash
+python aiwf.py reopen HKEI-52251 --reason "追加：统一字段长度 + prospect 类别"
+```
+
+它会：
+
+1. 把 stage 退回 `clarifying`（可用 `--stage planned|implementing` 指定）
+2. **把 `verify.json` / `review.json` / `ac-check.jsonl` 移到 `archive/`**（留档但失效，防止旧结论掩盖新代码）
+3. 记一条 reopen 流水
+
+之后的路线和第一次一样，但**历史全部保留**：requirement / decisions / plan / changes / 旧 AC 认领都在。只需要：
+
+```bash
+# 1) 在 requirement.md 追加新 AC  →  - [ ] AC-11 字段长度统一为 32
+python aiwf.py record HKEI-52251 --file DDL.sql --kind config --criterion AC-11 --why "ALTER 列长"
+# 2) 重新对账 → 验证 → 评审（旧的已失效，gate 会拦）
+python aiwf.py ac-check HKEI-52251 > ac-prompt.md
+python aiwf.py verify HKEI-52251 --cmd "mvn test" --result pass --commit <sha>
+python aiwf.py review HKEI-52251 --independent --verdict pass --commit <sha>
+```
+
+**判断标准**：不是看改动大小，而是看「原来的 AC 还要不要重新保证」。
+
+| 情况 | 做法 |
+|---|---|
+| 同一需求的补充（加枚举值、补字段） | **同 story + `reopen`** |
+| 影响面独立（DDL 跨端、要 DBA 评审、要单独排期） | **新建 story** |
+| 纯 bug 修复（原 AC 没兑现） | 不 reopen，直接 `record` 修 + 重跑 verify |
+
+### 另两个机制
+
+**review / verify 都会绑定 commit**：评审或验证之后代码又变了，gate 会拦
+（`review.json：评审的是 A，但当前提交是 B——代码变了，要重新评`）。
+**避免用旧结论掩盖新代码**，这是最常见的坑。
 
 ---
 
