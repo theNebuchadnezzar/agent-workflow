@@ -933,6 +933,48 @@ def cmd_ac_record(args):
     return 0
 
 
+def cmd_reopen(args):
+    """需求追加/变更：把已有 story 退回某个阶段，并让旧的验证/评审/对账失效。
+
+    历史文件不删，移到 archive/ 里留档。
+    """
+    d = _need_story(args.story)
+    if not d:
+        return 1
+    target = args.stage or "clarifying"
+    if target not in STAGES:
+        print(f"ERROR：阶段不存在：{target}　可选：{', '.join(STAGES)}", file=sys.stderr)
+        return 4
+
+    meta = load_meta(d) or {}
+    before = meta.get("stage", "?")
+
+    arch = d / "archive"
+    arch.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    moved = []
+    for fname in ("verify.json", "review.json", "ac-check.jsonl"):
+        src = d / fname
+        if src.exists():
+            shutil.move(str(src), str(arch / f"{fname}.{stamp}"))
+            moved.append(fname)
+
+    entry = {"ts": now(), "stage": target, "repo": "", "files": [], "kind": "note",
+             "criteria": [], "why": args.reason or "", "note": f"reopen: {before} -> {target}"}
+    with (d / "changes.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + chr(10))
+
+    meta["stage"] = target
+    save_meta(d, meta)
+
+    print(f"reopened  {before} -> {target}")
+    print(f"  原因：{args.reason or '（未填）'}")
+    if moved:
+        print(f"  已归档（失效，需重做）：{', '.join(moved)}")
+    print("  下一步：在 requirement.md 的「## 验收条件」追加新 AC（如 AC-11），再 record 挂上它。")
+    return 0
+
+
 def cmd_verify(args):
     d = _need_story(args.story)
     if not d:
@@ -941,6 +983,7 @@ def cmd_verify(args):
     data = _load_json(p)
     if not isinstance(data, dict):
         data = {"checks": []}
+    data["commit"] = (getattr(args, "commit", "") or "").strip()
     data.setdefault("checks", []).append(
         {"ts": now(), "cmd": args.cmd, "result": args.result, "detail": args.detail or ""})
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1050,6 +1093,11 @@ def cmd_gate(args):
             problems.append("verify.json：不是合法 JSON")
         elif not isinstance(v, dict) or not v.get("checks"):
             problems.append("verify.json：还没有验证结果（用 verify 命令记录）")
+        elif v.get("commit") and (meta.get("handoff") or {}).get("commit"):
+            vc = str(v.get("commit")).strip()
+            hc = str((meta.get("handoff") or {}).get("commit")).strip()
+            if not (hc.startswith(vc) or vc.startswith(hc)):
+                problems.append(f"verify.json：验证的是 {vc}，但当前提交是 {hc}——代码变了，要重跑验证")
 
     if rank >= 6:                                   # reviewed 起
         r = _load_json(d / "review.json")
@@ -1166,12 +1214,19 @@ def main(argv=None):
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_ac_record)
 
+    p = sub.add_parser("reopen", help="需求追加/变更：退回某阶段，旧验证与评审自动失效")
+    p.add_argument("story")
+    p.add_argument("--stage", default="clarifying", choices=STAGES)
+    p.add_argument("--reason", default="")
+    p.set_defaults(func=cmd_reopen)
+
     p = sub.add_parser("verify", help="记录一次验证结果")
     p.add_argument("story")
     p.add_argument("--cmd", required=True, help="实际执行的命令，如 mvn -q test")
     p.add_argument("--result", required=True, choices=["pass", "fail"])
     p.add_argument("--detail", default="")
     p.add_argument("--stage", default="")
+    p.add_argument("--commit", default="", help="验证的是哪个提交（建议填）")
     p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("review", help="记录独立评审结论")
