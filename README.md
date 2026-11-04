@@ -117,6 +117,36 @@ python aiwf.py link fix-login-npe --target 2026-11-01T09:45:43 --criterion AC-1
 
 > 挂 AC 这个动作本身就是自我检查：**说不清挂哪条，就说明这处改动可能不该做。**
 
+### 三个真实场景的处理
+
+**① 前后端分工，部分 AC 不归你**
+
+`ash
+python aiwf.py defer SHIP-1024 AC-1 AC-2 --owner frontend --reason 前端仓库另有人负责
+`
+
+转交的 AC 不再要求本 story 认领，gate 不再拦；cs 会标 →，c-check 提示词里也会注明「不在本 story 范围」。
+拿回来用 undefer。**这是有记录地转交，不是无痕忽略。**
+
+**② 需求多轮讨论，AC 结论变了**
+
+认领时会把 AC 的**文本哈希**一起记下。AC 文本一改，旧认领自动判为过期：
+
+`
+x AC 文本改过了，这些旧认领已失效，需要重新 record：AC-9
+`
+
+按新结论重新 
+ecord --criterion AC-9 即可恢复。**避免用旧方案当证据。**
+
+**③ 对账什么时候做**
+
+工具不能替你跑外部 agent，所以设了提醒：**自上次对账起每 3 条改动**提示一次，
+
+`ash
+python aiwf.py ac-check SHIP-1024 > ac-prompt.md
+`
+
 ---
 
 ## 命令

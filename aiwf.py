@@ -19,6 +19,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,9 @@ STAGES = ["new", "clarifying", "planned", "implementing",
 
 # 只有这两个阶段的改动需要挂验收条件
 WORK_STAGES = ("implementing", "verifying")
+
+# 自上次对账后新增多少条改动就提醒一次
+AUTO_AC_HINT_EVERY = 3
 
 NEXT_ACTION = {
     "new": "先做澄清：把 Jira 描述贴进 requirement.md，列出需要向需求方确认的问题。",
@@ -219,7 +223,10 @@ def _is_placeholder(text):
 
 
 def parse_criteria(req_text):
-    """解析验收条件，返回 [{id, text}]。有 AC-x 编号用编号，否则按顺序自动编号。"""
+    """解析验收条件，返回 [{id, text, hash}]。有 AC-x 编号用编号，否则按顺序自动编号。
+
+    hash 用来识别「认领时绑的是哪一版 AC」——AC 被改写后，旧认领自动失效。
+    """
     out, idx = [], 0
     for ln in _section(req_text, "## 验收条件").splitlines():
         m = re.match(r"\s*[-*]\s*\[[ xX]\]\s*(.+)$", ln)
@@ -229,12 +236,17 @@ def parse_criteria(req_text):
         idx += 1
         mm = re.match(r"(AC-[A-Za-z0-9]+)\s*[:：]?\s*(.*)$", body)
         if mm and mm.group(2).strip():
-            out.append({"id": mm.group(1), "text": mm.group(2).strip()})
+            cid, ctext = mm.group(1), mm.group(2).strip()
         elif mm:
-            out.append({"id": mm.group(1), "text": body})
+            cid, ctext = mm.group(1), body
         else:
-            out.append({"id": f"AC-{idx}", "text": body})
+            cid, ctext = f"AC-{idx}", body
+        out.append({"id": cid, "text": ctext, "hash": _ac_hash(ctext)})
     return out
+
+
+def _ac_hash(text):
+    return hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:8]
 
 
 def load_changes(d):
@@ -253,25 +265,63 @@ def _links(d):
             if c.get("kind") == "link" and c.get("target")}
 
 
-def ac_claims(d):
-    """{AC id: [改动 entry]}，包含事后通过 link 补挂的。"""
-    claims = {}
+def _deferred(d):
+    """已转交出去的 AC：{AC id: {reason, owner, at}}"""
+    meta = load_meta(d) or {}
+    return meta.get("deferred") or {}
+
+
+def _claim_entries(d):
+    """展开每条改动认领的 AC，并带上认领时的 AC 文本哈希。"""
     links = _links(d)
+    out = []
     for c in load_changes(d):
         if c.get("kind") == "link":
             continue
         crit = c.get("criteria") or []
+        hashes = c.get("acHashes") or {}
+        src = c
         if not crit and c.get("ts") in links:
             crit = links[c["ts"]].get("criteria") or []
+            hashes = links[c["ts"]].get("acHashes") or {}
+            src = links[c["ts"]]
         for ac in crit:
-            claims.setdefault(ac, []).append(c)
-    return claims
+            out.append({"ac": ac, "change": c, "hash": hashes.get(ac)})
+    return out
+
+
+def ac_claims(d):
+    """{AC id: [改动 entry]} —— 只算「认领时的 AC 版本仍然是当前版本」的。
+
+    返回两份：有效认领、过期认领（AC 被改写过）。
+    """
+    crits = {c["id"]: c["hash"] for c in parse_criteria(read_text(d, "requirement.md"))}
+    claims, stale = {}, {}
+    for e in _claim_entries(d):
+        ac, change, h = e["ac"], e["change"], e["hash"]
+        now = crits.get(ac)
+        if now is None:                      # AC 已被删掉
+            stale.setdefault(ac, []).append(change)
+            continue
+        if h and h != now:                   # 认领绑的是旧版 AC
+            stale.setdefault(ac, []).append(change)
+            continue
+        claims.setdefault(ac, []).append(change)
+    return claims, stale
 
 
 def unclaimed_acs(d):
+    """还没有有效认领、也没被转交出去的 AC。"""
     crits = parse_criteria(read_text(d, "requirement.md"))
-    claims = ac_claims(d)
-    return [c for c in crits if c["id"] not in claims]
+    claims, _ = ac_claims(d)
+    deferred = _deferred(d)
+    return [c for c in crits if c["id"] not in claims and c["id"] not in deferred]
+
+
+def stale_acs(d):
+    """过期认领：AC 文本改过。已经用新版本重新认领过的不再报。"""
+    claims, stale = ac_claims(d)
+    return {k: v for k, v in stale.items() if k not in claims}
 
 
 def unlinked_changes(d):
@@ -317,6 +367,14 @@ def last_ac_check(d):
         return json.loads(lines[-1])
     except json.JSONDecodeError:
         return None
+
+
+def _changes_since_ac_check(d):
+    """自上次 ac-check 之后新增了几条改动。"""
+    ac = last_ac_check(d)
+    last_ts = (ac or {}).get("ts", "") if ac else ""
+    return len([c for c in load_changes(d)
+                if c.get("kind") != "link" and (not last_ts or str(c.get("ts", "")) > last_ts)])
 
 
 def _need_story(slug):
@@ -388,22 +446,32 @@ def cmd_acs(args):
     if not crits:
         print("没有解析到验收条件。在 requirement.md 的「## 验收条件」下写 `- [ ] ...`。")
         return 0
-    claims = ac_claims(d)
+    claims, stale = ac_claims(d)
+    deferred = _deferred(d)
     unlinked = unlinked_changes(d)
 
-    print(f"{'ID':<8}{'认领':>5}  验收条件")
-    print("-" * 70)
+    print(f"{'ID':<8}{'认领':>5}{'转交':>5}  验收条件")
+    print("-" * 78)
     for c in crits:
         n = len(claims.get(c["id"], []))
         mark = f"{n}" if n else "-"
-        print(f"{c['id']:<8}{mark:>5}  {c['text']}")
+        dfr = "→" if c["id"] in deferred else ""
+        print(f"{c['id']:<8}{mark:>5}{dfr:>5}  {c['text']}")
+        if c["id"] in deferred:
+            info = deferred[c["id"]] or {}
+            print(f"         └ 已转交：{info.get('owner') or '?'} — {info.get('reason') or ''}")
 
-    missing = [c["id"] for c in crits if c["id"] not in claims]
+    missing = [c["id"] for c in crits
+               if c["id"] not in claims and c["id"] not in deferred]
     print()
+    if stale:
+        print(f"⚠ 过期认领：{', '.join(sorted(stale))}  ← AC 文本改过了，旧认领失效，需要重新 record")
     if missing:
         print(f"未认领：{', '.join(missing)}  ← 这些还没有任何改动说明在做")
     else:
-        print("全部认领。")
+        print("全部认领或已转交。")
+    if deferred:
+        print(f"已转交 {len(deferred)} 条（不算在 gate 要求里）")
     if unlinked:
         print(f"未挂验收条件的改动：{len(unlinked)} 条  ← 可能越界")
     return 0
@@ -634,7 +702,7 @@ def cmd_record(args):
     meta = load_meta(d) or {}
     stage = args.stage or meta.get("stage")
 
-    crits = {c["id"] for c in parse_criteria(read_text(d, "requirement.md"))}
+    crits = {c["id"]: c for c in parse_criteria(read_text(d, "requirement.md"))}
     given = args.criterion or []
     bad = [c for c in given if c not in crits]
     if bad:
@@ -645,9 +713,20 @@ def cmd_record(args):
             print("  requirement.md 里还没有解析到验收条件", file=sys.stderr)
         return 4
 
+    deferred = _deferred(d)
+    dgiven = [c for c in given if c in deferred]
+    if dgiven:
+        print(f"ERROR：这些 AC 已经转交出去了，不能在本 story 认领：{', '.join(dgiven)}", file=sys.stderr)
+        print("  需要拿回来：python aiwf.py undefer <story> " + " ".join(dgiven), file=sys.stderr)
+        return 7
+
+    # 认领时把 AC 的当前文本哈希一起记下——AC 之后被改写，这条认领就自动失效
+    ac_hashes = {c: crits[c]["hash"] for c in given}
+
     entry = {"ts": now(), "stage": stage, "repo": args.repo or "",
              "files": args.file or [], "kind": args.kind or "code",
-             "criteria": given, "why": args.why or "", "note": args.note or ""}
+             "criteria": given, "acHashes": ac_hashes,
+             "why": args.why or "", "note": args.note or ""}
     with (d / "changes.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -661,6 +740,54 @@ def cmd_record(args):
         missing = [c["id"] for c in unclaimed_acs(d)]
         print("  提醒：这次改动没挂验收条件（--criterion AC-x）。"
               + (f" 目前还没人认领：{', '.join(missing)}" if missing else ""))
+
+    # 提示该对账了（工具没法自动跑外部 agent，但可以在需要时提醒并准备好提示词）
+    since = _changes_since_ac_check(d)
+    if stage in WORK_STAGES and since and since % AUTO_AC_HINT_EVERY == 0:
+        print(f"  提示：自上次对账以来已有 {since} 条改动，该做一次兑现检查了：")
+        print(f"        python aiwf.py ac-check {meta.get('key') or args.story} > ac-prompt.md")
+    return 0
+
+
+def cmd_defer(args):
+    """把 AC 转交出去（前端负责 / 另一条线负责），不再要求本 story 认领。"""
+    d = _need_story(args.story)
+    if not d:
+        return 1
+    crits = {c["id"] for c in parse_criteria(read_text(d, "requirement.md"))}
+    ids = args.ac
+    bad = [c for c in ids if c not in crits]
+    if bad:
+        print(f"ERROR：这些验收条件不存在：{', '.join(bad)}", file=sys.stderr)
+        print(f"  可用：{', '.join(sorted(crits)) or '（无）'}", file=sys.stderr)
+        return 4
+
+    meta = load_meta(d) or {}
+    deferred = meta.setdefault("deferred", {})
+    for cid in ids:
+        deferred[cid] = {"owner": args.owner or "", "reason": args.reason or "", "at": now()}
+    save_meta(d, meta)
+    print(f"deferred  {', '.join(ids)}  owner={args.owner or '?'}  reason={args.reason or ''}")
+    print("  这些 AC 不再要求本 story 认领；对账时也会标为「不在范围内」。")
+    return 0
+
+
+def cmd_undefer(args):
+    """把转交出去的 AC 拿回来。"""
+    d = _need_story(args.story)
+    if not d:
+        return 1
+    meta = load_meta(d) or {}
+    deferred = meta.get("deferred") or {}
+    ids = args.ac
+    gone = [c for c in ids if c not in deferred]
+    for cid in ids:
+        deferred.pop(cid, None)
+    meta["deferred"] = deferred
+    save_meta(d, meta)
+    print(f"undeferred  {', '.join([c for c in ids if c not in gone]) or '（无变化）'}")
+    if gone:
+        print(f"  这些本来就没转交：{', '.join(gone)}")
     return 0
 
 
@@ -716,7 +843,8 @@ def cmd_ac_check(args):
         return 1
     meta = load_meta(d) or {}
     crits = parse_criteria(read_text(d, "requirement.md"))
-    claims = ac_claims(d)
+    claims, stale = ac_claims(d)
+    deferred = _deferred(d)
 
     if not crits:
         print("没有解析到验收条件，无法对账。先补 requirement.md 的「## 验收条件」。", file=sys.stderr)
@@ -724,6 +852,11 @@ def cmd_ac_check(args):
 
     lines = []
     for c in crits:
+        if c["id"] in deferred:
+            info = deferred[c["id"]] or {}
+            lines.append(f"- **{c['id']}** {c['text']}")
+            lines.append(f"  - 【已转交，不在本 story 范围】{info.get('owner') or '?'}：{info.get('reason') or ''}")
+            continue
         lines.append(f"- **{c['id']}** {c['text']}")
         got = claims.get(c["id"], [])
         if got:
@@ -864,6 +997,16 @@ def cmd_gate(args):
             problems.append("requirement.md：这些验收条件没有任何改动认领："
                             + ", ".join(c["id"] for c in missing))
 
+        stale = stale_acs(d)
+        if stale:
+            problems.append("AC 文本改过了，这些旧认领已失效，需要重新 record："
+                            + ", ".join(sorted(stale)))
+
+        dfr = _deferred(d)
+        if dfr:
+            hints.append("已转交 " + str(len(dfr)) + " 条 AC（不计入本 story 的认领要求）："
+                         + ", ".join(sorted(dfr)))
+
         ac = last_ac_check(d)
         if ac and ac.get("verdict") == "block":
             problems.append("ac-check.jsonl：最近一次兑现检查判定 block（有验收条件未兑现）")
@@ -947,6 +1090,18 @@ def main(argv=None):
     p.add_argument("--kind", default="code", choices=["code", "test", "doc", "config", "note"])
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_record)
+
+    p = sub.add_parser("defer", help="把部分 AC 转交给别处（前端 / 另一组件），不再要求本 story 认领")
+    p.add_argument("story")
+    p.add_argument("ac", nargs="+")
+    p.add_argument("--owner", default="", help="谁负责，如 frontend / repo 名")
+    p.add_argument("--reason", default="")
+    p.set_defaults(func=cmd_defer)
+
+    p = sub.add_parser("undefer", help="把转交出去的 AC 拿回来")
+    p.add_argument("story")
+    p.add_argument("ac", nargs="+")
+    p.set_defaults(func=cmd_undefer)
 
     p = sub.add_parser("handoff", help="更新交接指针（分支/PR/提交/待办）")
     p.add_argument("story")
