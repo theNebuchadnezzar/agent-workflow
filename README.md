@@ -38,8 +38,8 @@
 
 ```
 <dataDir>/                          # 默认 ./stories，可用 AIWF_DATA 指到仓库外
-  2026-11-001-fix-login-npe/
-    meta.json                       # 状态、仓库列表、Jira 号、handoff 交接指针
+  2026-11-04-SHIP-1024-fix-login-npe/
+    meta.json                       # 状态、tracker 号(key)、仓库列表、handoff 交接指针
     requirement.md                  # 需求 + 澄清问答 + 编号化的验收条件（AC-1、AC-2…）
     decisions.md                    # 决策记录：结论 ← 被什么驱动 ← 何时可推翻
     plan.md                         # 实施方案：改哪些文件、为什么
@@ -122,7 +122,7 @@ python aiwf.py link fix-login-npe --target 2026-11-01T09:45:43 --criterion AC-1
 ## 命令
 
 ```bash
-python aiwf.py init "fix-login-npe" --title "修复登录空指针" --repo order-service
+python aiwf.py init "fix-login-npe" --title "修复登录空指针" --key SHIP-1024 --repo order-service
 python aiwf.py status [--all]              # 进行中的 story（含"缺几条 AC 没认领"）
 python aiwf.py acs fix-login-npe           # 验收条件与认领情况
 python aiwf.py context fix-login-npe       # 打包上下文，可直接粘给任何 agent
@@ -221,3 +221,4 @@ python aiwf.py gate fix-login-npe          # 检查门禁（失败退出码 2）
 ## 一句话
 
 **你只在三个点说话：定 AC、审方案的理由、决定合并。中间由 agent 自己记录，gate 自动查，独立 agent 对账。**
+

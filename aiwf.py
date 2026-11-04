@@ -51,7 +51,7 @@ NEXT_ACTION = {
 
 META_TMPL = {
     "id": "", "slug": "", "title": "", "stage": "new",
-    "created": "", "jira": "", "repos": [],
+    "created": "", "key": "", "jira": "", "repos": [],
     "handoff": {"branch": "", "pr": "", "commit": "", "todo": ""},
 }
 
@@ -164,13 +164,29 @@ def slugify(s):
     return s.strip("-") or "story"
 
 
+def safe_key(k):
+    """把 tracker 号（Jira / GitHub issue / 禅道…）清洗成可做目录名的一段。
+
+    SHIP-1024 / ship_1024 / #123 -> SHIP-1024 / SHIP-1024 / 123
+    返回大写；空则返回 ""。
+    """
+    k = (k or "").strip().lstrip("#").strip()
+    k = re.sub(r"[^A-Za-z0-9._-]+", "-", k).strip("-")
+    return k.upper()
+
+
 def story_path(slug):
+    """定位 story：支持完整目录名、目录名后缀、slug、以及 tracker 号。"""
     if not STORY_DIR.exists():
         return None
+    q = slug.strip()
     for d in sorted(STORY_DIR.iterdir()):
         if not d.is_dir():
             continue
-        if d.name == slug or d.name.endswith("-" + slug) or d.name == slugify(slug):
+        if d.name == q or d.name.endswith("-" + q) or d.name == slugify(q):
+            return d
+        meta = load_meta(d) or {}
+        if meta.get("key") and str(meta["key"]).lower() == q.lower():
             return d
     return None
 
@@ -314,19 +330,40 @@ def _need_story(slug):
 def cmd_init(args):
     STORY_DIR.mkdir(parents=True, exist_ok=True)
     date = datetime.now().strftime("%Y-%m-%d")
-    seq = 1
-    while True:
-        sid = f"{date}-{seq:03d}"
-        if not any(p.name.startswith(sid) for p in STORY_DIR.iterdir() if p.is_dir()):
-            break
-        seq += 1
     slug = slugify(args.slug)
-    d = STORY_DIR / f"{sid}-{slug}"
+    key = safe_key(getattr(args, "key", "") or "")
+
+    # 同一个 tracker 号只能有一个 story
+    if key:
+        for d0 in STORY_DIR.iterdir():
+            if not d0.is_dir():
+                continue
+            m0 = load_meta(d0) or {}
+            if str(m0.get("key", "")).upper() == key:
+                print(f"ERROR：{key} 已经有一个 story 了：{d0.name}", file=sys.stderr)
+                print("  同一个单号不要建第二个；需要继续做就打开原来那个。", file=sys.stderr)
+                return 6
+
+    # 目录名：<日期>-<KEY>-<slug>；没有 key 时退回当日序号
+    if key:
+        sid = f"{date}-{key}"
+        d = STORY_DIR / f"{sid}-{slug}"
+        if d.exists():
+            print(f"ERROR：目录已存在：{d}", file=sys.stderr)
+            return 6
+    else:
+        seq = 1
+        while True:
+            sid = f"{date}-{seq:03d}"
+            if not any(p.name.startswith(sid) for p in STORY_DIR.iterdir() if p.is_dir()):
+                break
+            seq += 1
+        d = STORY_DIR / f"{sid}-{slug}"
     d.mkdir(parents=True)
 
     meta = json.loads(json.dumps(META_TMPL))
-    meta.update(id=sid, slug=slug, title=args.title or slug, created=now(),
-                jira=args.jira or "",
+    meta.update(id=d.name, key=key, slug=slug, title=args.title or slug,
+                created=now(), jira=key,
                 repos=[{"name": r, "path": "", "status": "pending"} for r in (args.repo or [])])
     save_meta(d, meta)
     (d / "requirement.md").write_text(REQ_TMPL.format(**meta), encoding="utf-8")
@@ -335,7 +372,8 @@ def cmd_init(args):
     (d / "changes.jsonl").write_text("", encoding="utf-8")
 
     print(f"created  {d}")
-    print(f"id       {sid}")
+    print(f"id       {d.name}")
+    print(f"key      {key or '（无，用当日序号）'}")
     print(f"next     {NEXT_ACTION['new']}")
     return 0
 
@@ -386,16 +424,18 @@ def cmd_status(args):
         last = (ac or {}).get("verdict", "-") if ac else "-"
         mark = {"block": "x", "warn": "!"}.get(last, "")
         missing = len(unclaimed_acs(d))
-        rows.append((meta.get("id", "?"), stage, last + mark,
+        created = str(meta.get("created", ""))[:10] or "-"
+        rows.append((created, meta.get("key") or "-", stage, last + mark,
                      f"{missing}" if missing else "-",
-                     len(load_changes(d)), meta.get("title", "")))
+                     len(load_changes(d)), meta.get("title", ""), meta.get("slug", "")))
     if not rows:
         print("没有进行中的 story（加 --all 看已完成）。")
         return 0
-    print(f"{'ID':<16}{'STAGE':<14}{'AC':>5}{'缺':>4}{'CHG':>4}  TITLE")
-    print("-" * 76)
-    for sid, stage, last, miss, n, title in rows:
-        print(f"{sid:<16}{stage:<14}{last:>5}{miss:>4}{n:>4}  {title}")
+    print(f"{'DATE':<12}{'KEY':<13}{'STAGE':<13}{'AC':>4}{'缺':>4}{'CHG':>4}  TITLE")
+    print("-" * 92)
+    for created, key, stage, last, miss, n, title, slug in rows:
+        label = title or slug
+        print(f"{created:<12}{key:<13}{stage:<13}{last:>4}{miss:>4}{n:>4}  {label}")
     print("\nAC: 最近一次兑现检查 pass / warn(!) / block(x) / -（还没查）")
     print("缺: 还没有改动认领的验收条件数量")
     return 0
@@ -772,7 +812,8 @@ def main(argv=None):
     p.add_argument("slug")
     p.add_argument("--title", default="")
     p.add_argument("--repo", action="append")
-    p.add_argument("--jira", default="")
+    p.add_argument("--key", "--jira", dest="key", default="",
+                   help="tracker 号：Jira SHIP-1024 / GitHub #123 / 禅道 等")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("status", help="所有进行中的 story")
@@ -854,3 +895,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
