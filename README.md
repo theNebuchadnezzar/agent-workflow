@@ -4,7 +4,7 @@
 >
 > 不生成代码——生成交给模型。它解决模型做不了的三件事：**上下文供给、状态推进、结果验证。**
 
-纯 Python 标准库，单文件 30KB，无依赖。
+纯 Python 标准库，单文件 47KB，无依赖。
 
 ---
 
@@ -47,6 +47,7 @@
     ac-check.jsonl                  # 验收条件兑现检查（可多次）
     verify.json                     # 自检：编译/测试结果
     review.json                     # 独立评审结论（必须换 session）
+    archive/                        # reopen 时归档的旧 verify/review/ac-check（留档但失效）
 ```
 
 ---
@@ -58,6 +59,8 @@ new → clarifying → planned → implementing → verifying → reviewing → 
          ↓              ↓            ↓            ↓          ↓
       blocked        blocked      blocked      failed    打回 implementing
 ```
+
+> **`reopen` 可以从任意阶段退回 `clarifying`**（需求追加时用）：旧的 `verify` / `review` / `ac-check` 会移到 `archive/` 归档失效，历史保留但不能再当证据。
 
 ### 三个检查点，各管一段
 
@@ -81,9 +84,9 @@ new → clarifying → planned → implementing → verifying → reviewing → 
 |---|---|
 | clarifying 起 | 澄清问答非空，且**验收条件至少有一条 `- [ ] 实质内容`**（空复选框不算） |
 | planned 起 | plan.md 的「改哪些文件」表有真实数据行 |
-| implementing 起 | changes 至少一条；**每条 code/test 改动都挂了 AC**；**每条 AC 都有人认领**；最近一次 ac-check 不是 `block` |
-| verifying 起 | **必须做过一次 ac-check（pass/warn）**；verify.json 的 checks 非空 |
-| reviewed 起 | review.json 存在、`independent=true`、`verdict=pass` |
+| implementing 起 | changes 至少一条；**每条 code/test 改动都挂了 AC**；**每条 AC 都有人认领**（转交的除外）；**AC 文本改过的旧认领不算数**；最近一次 ac-check 不是 `block` |
+| verifying 起 | **必须做过一次 ac-check（pass/warn）**；verify.json 有 checks；**若 verify 记了 `commit`，必须与 handoff 的提交一致** |
+| reviewed 起 | review.json 存在、`independent=true`、`verdict=pass`；**若 review 记了 `commit`，必须与 handoff 的提交一致**（评完又改代码要重评） |
 
 ---
 
@@ -178,12 +181,6 @@ python aiwf.py review HKEI-52251 --independent --verdict pass --commit <sha>
 | 影响面独立（DDL 跨端、要 DBA 评审、要单独排期） | **新建 story** |
 | 纯 bug 修复（原 AC 没兑现） | 不 reopen，直接 `record` 修 + 重跑 verify |
 
-### 另两个机制
-
-**review / verify 都会绑定 commit**：评审或验证之后代码又变了，gate 会拦
-（`review.json：评审的是 A，但当前提交是 B——代码变了，要重新评`）。
-**避免用旧结论掩盖新代码**，这是最常见的坑。
-
 ---
 
 ## 命令
@@ -191,7 +188,9 @@ python aiwf.py review HKEI-52251 --independent --verdict pass --commit <sha>
 ```bash
 python aiwf.py init "fix-login-npe" --title "修复登录空指针" --key SHIP-1024 --repo order-service
 python aiwf.py status [--all]              # 进行中的 story（含"缺几条 AC 没认领"）
-python aiwf.py acs fix-login-npe           # 验收条件与认领情况
+python aiwf.py acs fix-login-npe           # 验收条件与认领情况（含转交、过期认领）
+python aiwf.py where                       # 数据目录在哪、有没有"分裂"
+python aiwf.py adopt [--yes]               # 把仓库内 ./stories 搬到当前数据目录
 python aiwf.py context fix-login-npe       # 打包上下文，可直接粘给任何 agent
 
 python aiwf.py record fix-login-npe --stage implementing --repo order-service \
@@ -201,18 +200,23 @@ python aiwf.py handoff fix-login-npe --branch fix/npe --pr 128 --commit abc1234 
         --todo "补一条空值回归用例"          # 交接指针：给指针，不复制历史
 python aiwf.py ac-check fix-login-npe > ac-prompt.md   # 生成对账提示词
 python aiwf.py ac-record fix-login-npe --verdict pass --fulfilled AC-1 --fulfilled AC-2
-python aiwf.py verify fix-login-npe --cmd "mvn -q test" --result pass
+python aiwf.py defer fix-login-npe AC-3 --owner frontend --reason "前端仓库负责"  # 转交 AC
+python aiwf.py undefer fix-login-npe AC-3   # 把转交的 AC 拿回来
+python aiwf.py reopen fix-login-npe --reason "追加需求"   # 退回 clarifying，旧结论失效
+python aiwf.py verify fix-login-npe --cmd "mvn -q test" --result pass --commit abc1234
 python aiwf.py review fix-login-npe --independent --reviewer reviewer-a \
         --verdict pass --issue "异常处理建议统一包装" \
         --commit abc1234 --range 200c8d49..abc1234   # 记住评的是哪份代码
 python aiwf.py gate fix-login-npe          # 检查门禁（失败退出码 2）
 ```
 
-### 三个刻意的设计
+### 五个刻意的设计
 
 1. **`review` 不带 `--independent` 会被拒绝**（退出码 3）——强制换 session 评。
 2. **`review --verdict fail` 自动打回 `implementing`**，修完必须再评。
 3. **`gate` 退出码非零**，可直接塞进 CI 或 pre-push hook。
+4. **`verify` / `review` 绑定被评审的 commit**——评审或验证之后代码又变了，gate 会拦，**旧结论不能掩盖新代码**。
+5. **`reopen` 归档而不是删除**——需求追加时历史可审计，但旧结论自动不能再当证据。
 
 ### 退出码
 
@@ -224,6 +228,8 @@ python aiwf.py gate fix-login-npe          # 检查门禁（失败退出码 2）
 | 3 | review 未声明独立 |
 | 4 | 挂了不存在的 AC |
 | 5 | link 的 target ts 不存在 |
+| 6 | tracker 号已有 story / 目录已存在 |
+| 7 | 这条 AC 已转交出去，不能在本 story 认领（需先 `undefer`） |
 
 ---
 
@@ -248,7 +254,7 @@ python aiwf.py gate fix-login-npe          # 检查门禁（失败退出码 2）
 |---|---|---|
 | 物理 | `AIWF_DATA` 指向仓库外 | 工作数据根本不在 git 工作区里 |
 | 规则 | `.gitignore` 里的 `stories/` | 即使忘了设环境变量也不会被 add |
-| 操作 | 只 pull 不 push 的部署可以设 `--push` 为无效地址 | 手滑 push 也会失败 |
+| 操作 | 只读部署可把 `--push` 地址设为无效值 | 手滑 push 也会失败 |
 
 **建议**：工作数据目录一律放仓库外。仓库里只留代码和 md。
 
@@ -258,15 +264,13 @@ python aiwf.py gate fix-login-npe          # 检查门禁（失败退出码 2）
 
 | 旧数据缺什么 | 新版本怎么处理 |
 |---|---|
-| meta 没有 key | 回退到 jira 显示；两者都没有就显示 - |
-| meta 没有 deferred | 视为「没有转交」 |
-| changes.jsonl 没有 cHashes | 视为「无法校验版本」，认领仍然有效（不会被误判过期） |
+| `meta` 没有 `key` | 回退到 `jira` 显示；两者都没有就显示 `-` |
+| `meta` 没有 `deferred` | 视为「没有转交」 |
+| `changes.jsonl` 没有 `acHashes` | 视为「无法校验版本」，认领仍然有效（不会被误判过期） |
 | JSON 文件带 BOM | 自动兼容（UTF-8 BOM 会被吃掉） |
-| meta 的 id 是短号（如 2026-11-01-001） | 只用于展示，不影响定位 |
+| `meta` 的 `id` 是短号（如 `2026-11-01-001`） | 只用于展示，不影响定位 |
 
-**唯一的变化**：只有升级后新 
-ecord 的改动才带版本哈希，才会参与「过期认领」检查。老记录要享受这层保护，重新 
-ecord 一次即可（旧的自动失效）。
+**唯一的变化**：只有升级后新 `record` 的改动才带版本哈希，才会参与「过期认领」检查。老记录要享受这层保护，重新 `record` 一次即可（旧的自动失效）。
 
 ### 数据目录在哪，以及"分裂"排查
 
@@ -288,8 +292,10 @@ python aiwf.py adopt     # 把仓库内 ./stories 搬到当前数据目录（先
 |---|---|---|
 | v0 | init / status / context / record / gate | ✅ |
 | v1 | 独立 review、PR 指针交接、验收条件硬门禁 | ✅ |
-| v1.1 | 独立复核（watch） | ✅ 已被 v1.2 取代 |
+| v1.1 | 独立复核（初版，后更名 ac-check） | ✅ 已被 v1.2 取代 |
 | v1.2 | AC 编号化 + 改动挂 AC + 兑现检查（ac-check）+ link 补挂 | ✅ |
+| v1.2.1 | tracker 号命名、数据目录自检、AC 转交（defer）、**AC 版本绑定**、verify/review 绑 commit、reopen、BOM 兼容 | ✅ |
+| 真实项目验证 | 一个真实 Jira 单跑完 clarifying → reviewed（含前后端分工与需求追加） | ✅ |
 | v2 | `verify` 自动跑命令；`status` 显示 token/成本 | 待做 |
 | v3 | watchdog 自动化（headless agent 直接跑 ac-check） | 待做 |
 
