@@ -191,14 +191,23 @@ def story_path(slug):
         if d.name == q or d.name.endswith("-" + q) or d.name == slugify(q):
             return d
         meta = load_meta(d) or {}
-        if meta.get("key") and str(meta["key"]).lower() == q.lower():
-            return d
+        for k in (meta.get("key"), meta.get("jira")):
+            if k and str(k).lower() == q.lower():
+                return d
     return None
 
 
 def load_meta(d):
+    """读 meta.json；带 BOM 或 JSON 损坏时不崩，返回 {} 并提示。"""
     p = d / "meta.json"
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    if not p.exists():
+        return None
+    raw = p.read_text(encoding="utf-8-sig", errors="replace").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"WARN: {p} 不是合法 JSON（{e}），按空 meta 处理", file=sys.stderr)
+        return {}
 
 
 def save_meta(d, meta):
@@ -208,7 +217,7 @@ def save_meta(d, meta):
 
 def read_text(d, name):
     p = d / name
-    return p.read_text(encoding="utf-8") if p.exists() else ""
+    return p.read_text(encoding="utf-8-sig") if p.exists() else ""
 
 
 def _section(text, header):
@@ -347,14 +356,14 @@ def _plan_has_rows(plan_text):
 def _jsonl_lines(p):
     if not p.exists():
         return []
-    return [x for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+    return [x for x in p.read_text(encoding="utf-8-sig").splitlines() if x.strip()]
 
 
 def _load_json(p):
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        return json.loads(p.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError:
         return "INVALID"
 
@@ -593,7 +602,8 @@ def cmd_status(args):
         mark = {"block": "x", "warn": "!"}.get(last, "")
         missing = len(unclaimed_acs(d))
         created = str(meta.get("created", ""))[:10] or "-"
-        rows.append((created, meta.get("key") or "-", stage, last + mark,
+        show_key = meta.get("key") or meta.get("jira") or "-"
+        rows.append((created, show_key, stage, last + mark,
                      f"{missing}" if missing else "-",
                      len(load_changes(d)), meta.get("title", ""), meta.get("slug", "")))
     if not rows:
@@ -641,11 +651,18 @@ def cmd_context(args):
 
     crits = parse_criteria(read_text(d, "requirement.md"))
     if crits:
-        claims = ac_claims(d)
+        claims, stale_c = ac_claims(d)
+        deferred_c = _deferred(d)
         out += ["## 验收条件与认领", ""]
         for c in crits:
+            if c["id"] in deferred_c:
+                info = deferred_c[c["id"]] or {}
+                out.append(f"- **{c['id']}** {c['text']}　→ 已转交 {info.get('owner') or '?'}")
+                continue
             n = len(claims.get(c["id"], []))
             out.append(f"- **{c['id']}** {c['text']}" + (f"　（已认领 {n} 处）" if n else "　**（还没有人认领）**"))
+        if stale_c:
+            out += ["", f"⚠ 过期认领（AC 文本改过，需重新 record）：{', '.join(sorted(stale_c))}"]
         out.append("")
         out += ["**每改一处，必须用 record 挂上它兑现的验收条件**：", "",
                 "```", "python aiwf.py record <story> --file <路径> --criterion <AC-x> --why \"<一句话>\"",
