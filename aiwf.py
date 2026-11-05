@@ -30,6 +30,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+# Windows 控制台默认不是 UTF-8，输出中文/符号会 UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 _env_data = os.environ.get("AIWF_DATA", "").strip()
 STORY_DIR = Path(_env_data).expanduser() if _env_data else ROOT / "stories"
 
@@ -41,6 +48,20 @@ WORK_STAGES = ("implementing", "verifying")
 
 # 自上次对账后新增多少条改动就提醒一次
 AUTO_AC_HINT_EVERY = 3
+
+# ── 明文凭据扫描 ──
+SECRET_KEY = re.compile(
+    r"(pass(word|wd)?|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key"
+    r"|credential|密码|口令)", re.I)
+SKIP_EXT = {".class", ".jar", ".war", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".zip",
+            ".gz", ".pdf", ".docx", ".xlsx", ".pptx", ".woff", ".woff2", ".ttf",
+            ".so", ".dll", ".exe", ".bin", ".lock"}
+SKIP_DIRS = {".git", "node_modules", "target", "build", "out", "dist", ".gradle",
+             ".idea", ".vscode", "__pycache__", ".next", "vendor"}
+# 看起来就不是真实值的情况
+PLACEHOLDER = re.compile(
+    r"^(\$|\{\{|<|your|xxx+|change_?me|todo|tbd|none|null|placeholder|\*\*\*"
+    r"|env\(|os\.environ|getenv|示例|环境变量|运行时|待填|-+$)", re.I)
 
 NEXT_ACTION = {
     "new": "先做澄清：把 Jira 描述贴进 requirement.md，列出需要向需求方确认的问题。",
@@ -390,6 +411,8 @@ def _need_story(slug):
     d = story_path(slug)
     if not d:
         print(f"找不到 story: {slug}", file=sys.stderr)
+        print(f"  当前数据目录：{STORY_DIR}", file=sys.stderr)
+        print("  看所有 story：python aiwf.py where", file=sys.stderr)
     return d
 
 
@@ -514,6 +537,91 @@ def data_dir_report(verbose=False):
 def _print_data_dir(verbose=False):
     for ln in data_dir_report(verbose=verbose):
         print(ln)
+
+
+def _mask(value):
+    v = value.strip().strip("\"'`").strip()
+    if len(v) <= 4:
+        return "*" * len(v)
+    return v[:2] + "*" * max(3, len(v) - 4) + v[-2:]
+
+
+def scan_for_secrets(root, limit=60):
+    """返回 [(path, lineno, key, masked_value)]。"""
+    found = []
+    root = Path(root)
+    if not root.exists():
+        return found
+    files = [root] if root.is_file() else [
+        p for p in root.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() not in SKIP_EXT
+        and not any(part in SKIP_DIRS for part in p.parts)
+        and p.stat().st_size < 2 * 1024 * 1024
+    ]
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except (OSError, UnicodeError):
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if len(line) > 400:
+                continue
+            # key = value / key: value
+            m = re.search(r"([A-Za-z0-9_.\-]{2,40})\s*[:=]\s*(\S.*)$", line)
+            if not m:
+                continue
+            key, val = m.group(1), m.group(2).strip()
+            if not SECRET_KEY.search(key):
+                continue
+            val = val.split()[0] if val.split() else val
+            if len(val) < 4 or PLACEHOLDER.match(val):
+                continue
+            # 排除代码/注释：函数调用、带引号包裹的代码、注释行
+            if any(ch in val for ch in "(){}[];"):
+                continue
+            if val.endswith((":", ",", ".")) or val.startswith(("#", "//")):
+                continue
+            if line.lstrip().startswith(("#", "//", "*")):
+                continue
+            # 纯字母且短、或像标识符（无数字无符号）的，多半不是真实密钥
+            if re.fullmatch(r"[A-Za-z_.]+", val) and len(val) < 12:
+                continue
+            found.append((str(f), i, key, _mask(val)))
+            if len(found) >= limit:
+                return found
+    return found
+
+
+def cmd_scan(args):
+    """扫描明文凭据（默认扫 story 目录；可指定任意目录）。"""
+    if args.story:
+        d = _need_story(args.story)
+        if not d:
+            return 1
+        roots = [d]
+    elif args.path:
+        roots = [Path(args.path).expanduser()]
+    else:
+        roots = [STORY_DIR]
+
+    total = 0
+    for root in roots:
+        hits = scan_for_secrets(root)
+        print(f"扫描  {root}")
+        if not hits:
+            print("  未发现疑似明文凭据。")
+            continue
+        for path, lineno, key, masked in hits:
+            rel = path.replace(str(root), ".") if str(root) in path else path
+            print(f"  {rel}:{lineno}  {key} = {masked}")
+        total += len(hits)
+    if total:
+        print(f"\n共 {total} 处疑似明文凭据。")
+        print("  处理：真实值移到环境变量或 .local 文件（不入库），文件里只留变量名；")
+        print("        已经提交过的，先轮换凭据再清理历史（清历史不等于失效）。")
+        return 8
+    return 0
 
 
 def cmd_where(args):
@@ -834,6 +942,14 @@ def cmd_link(args):
         print(f"ERROR：这些验收条件不存在：{', '.join(bad)}", file=sys.stderr)
         print(f"  可用：{', '.join(sorted(crits)) or '（无）'}", file=sys.stderr)
         return 4
+    crit_map = {c["id"]: c["hash"] for c in parse_criteria(read_text(d, "requirement.md"))}
+    deferred = _deferred(d)
+    dgiven = [c for c in (args.criterion or []) if c in deferred]
+    if dgiven:
+        print(f"ERROR：这些 AC 已转交，不能补挂：{', '.join(dgiven)}", file=sys.stderr)
+        print("  需要拿回来：python aiwf.py undefer <story> " + " ".join(dgiven), file=sys.stderr)
+        return 7
+
     target = [c for c in load_changes(d) if c.get("ts") == args.target]
     if not target:
         print(f"ERROR：找不到 ts={args.target} 的改动记录", file=sys.stderr)
@@ -844,7 +960,9 @@ def cmd_link(args):
         return 5
 
     entry = {"ts": now(), "kind": "link", "target": args.target,
-             "criteria": args.criterion or [], "stage": target[0].get("stage"),
+             "criteria": args.criterion or [],
+             "acHashes": {c: crit_map[c] for c in (args.criterion or [])},
+             "stage": target[0].get("stage"),
              "repo": target[0].get("repo", ""), "files": target[0].get("files") or [],
              "why": args.why or "", "note": "补挂验收条件"}
     with (d / "changes.jsonl").open("a", encoding="utf-8") as f:
@@ -915,7 +1033,7 @@ def cmd_ac_record(args):
     fulfilled = [a.split("=")[0] for a in (args.fulfilled or [])]
     entry = {"ts": now(), "verdict": args.verdict,
              "acs": [{"id": c["id"], "fulfilled": c["id"] in fulfilled,
-                      "evidence": c["text"]} for c in parse_criteria(read_text(d, "requirement.md"))],
+                      "acText": c["text"]} for c in parse_criteria(read_text(d, "requirement.md"))],
              "undeclared": args.issue or [], "reviewer": args.reviewer or "",
              "note": args.note or ""}
     # 允许用 --fulfilled AC-1 精确标注；没给则按 verdict 推断（pass=全兑现）
@@ -1041,6 +1159,11 @@ def cmd_gate(args):
     problems = []
     hints = []
 
+    sec = scan_for_secrets(d, limit=5)
+    if sec:
+        hints.append(f"story 目录里有 {len(sec)} 处疑似明文凭据（如 {sec[0][2]}），"
+                     "建议移出并轮换；详见 python aiwf.py scan --story 或 scan")
+
     if rank >= 1:                                   # clarifying 起
         req = read_text(d, "requirement.md")
         if _is_placeholder(_section(req, "## 澄清问答")):
@@ -1066,6 +1189,14 @@ def cmd_gate(args):
         if missing:
             problems.append("requirement.md：这些验收条件没有任何改动认领："
                             + ", ".join(c["id"] for c in missing))
+
+        nohash = [c for c in load_changes(d)
+                  if c.get("kind") in ("code", "test")
+                  and (c.get("criteria") or [])
+                  and not (c.get("acHashes") or {})]
+        if nohash:
+            hints.append(f"{len(nohash)} 条认领没有版本哈希（升级前的记录），"
+                         "AC 文本改动后不会自动失效；需要保护就重新 record 一次")
 
         stale = stale_acs(d)
         if stale:
@@ -1093,11 +1224,18 @@ def cmd_gate(args):
             problems.append("verify.json：不是合法 JSON")
         elif not isinstance(v, dict) or not v.get("checks"):
             problems.append("verify.json：还没有验证结果（用 verify 命令记录）")
-        elif v.get("commit") and (meta.get("handoff") or {}).get("commit"):
-            vc = str(v.get("commit")).strip()
-            hc = str((meta.get("handoff") or {}).get("commit")).strip()
-            if not (hc.startswith(vc) or vc.startswith(hc)):
+        else:
+            last_v = (v.get("checks") or [{}])[-1]
+            if last_v.get("result") != "pass":
+                problems.append(
+                    f"verify.json：最近一次验证结果是 {last_v.get('result')!r}，不是 pass"
+                    f"（命令：{last_v.get('cmd') or '-'}）——修完要重跑")
+            vc = str(v.get("commit") or "").strip()
+            hc = str((meta.get("handoff") or {}).get("commit") or "").strip()
+            if vc and hc and not (hc.startswith(vc) or vc.startswith(hc)):
                 problems.append(f"verify.json：验证的是 {vc}，但当前提交是 {hc}——代码变了，要重跑验证")
+            elif not vc:
+                hints.append("verify.json 没记验证的 commit，建议 verify --commit <sha>")
 
     if rank >= 6:                                   # reviewed 起
         r = _load_json(d / "review.json")
@@ -1117,6 +1255,16 @@ def cmd_gate(args):
                                 "——代码变了，要重新评")
             elif not rc:
                 hints.append("review.json 没记被评审的 commit，建议 review --commit <sha>")
+
+            r_ts = str(r.get("ts") or "")
+            if r_ts:
+                late = [c for c in load_changes(d)
+                        if c.get("kind") in ("code", "test")
+                        and str(c.get("ts") or "") > r_ts]
+                if late:
+                    problems.append(
+                        f"changes.jsonl：评审（{r_ts}）之后还有 {len(late)} 条代码/测试改动"
+                        "——评审已过期，要重新评")
 
     if problems:
         print(f"gate FAILED  ({stage})")
@@ -1142,6 +1290,11 @@ def main(argv=None):
     p.add_argument("--key", "--jira", dest="key", default="",
                    help="tracker 号：Jira SHIP-1024 / GitHub #123 / 禅道 等")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("scan", help="扫描明文凭据（默认扫 story 目录，可指定目录）")
+    p.add_argument("path", nargs="?", default="", help="要扫描的目录，默认 story 数据目录")
+    p.add_argument("--story", default="", help="只扫某个 story 目录")
+    p.set_defaults(func=cmd_scan)
 
     p = sub.add_parser("where", help="打印数据目录与统计，排查文件不一致")
     p.set_defaults(func=cmd_where)

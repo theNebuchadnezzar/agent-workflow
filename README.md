@@ -85,8 +85,8 @@ new → clarifying → planned → implementing → verifying → reviewing → 
 | clarifying 起 | 澄清问答非空，且**验收条件至少有一条 `- [ ] 实质内容`**（空复选框不算） |
 | planned 起 | plan.md 的「改哪些文件」表有真实数据行 |
 | implementing 起 | changes 至少一条；**每条 code/test 改动都挂了 AC**；**每条 AC 都有人认领**（转交的除外）；**AC 文本改过的旧认领不算数**；最近一次 ac-check 不是 `block` |
-| verifying 起 | **必须做过一次 ac-check（pass/warn）**；verify.json 有 checks；**若 verify 记了 `commit`，必须与 handoff 的提交一致** |
-| reviewed 起 | review.json 存在、`independent=true`、`verdict=pass`；**若 review 记了 `commit`，必须与 handoff 的提交一致**（评完又改代码要重评） |
+| verifying 起 | **必须做过一次 ac-check（pass/warn）**；**verify 最近一次结果必须是 `pass`**；**若 verify 记了 `commit`，必须与 handoff 的提交一致** |
+| reviewed 起 | review.json 存在、`independent=true`、`verdict=pass`；**若 review 记了 `commit`，必须与 handoff 的提交一致**；**评审之后不能再有 code/test 改动**（否则评审过期，要重评） |
 
 ---
 
@@ -190,6 +190,7 @@ python aiwf.py init "fix-login-npe" --title "修复登录空指针" --key SHIP-1
 python aiwf.py status [--all]              # 进行中的 story（含"缺几条 AC 没认领"）
 python aiwf.py acs fix-login-npe           # 验收条件与认领情况（含转交、过期认领）
 python aiwf.py where                       # 数据目录在哪、有没有"分裂"
+python aiwf.py scan                        # 扫描明文凭据（可指定目录）
 python aiwf.py adopt [--yes]               # 把仓库内 ./stories 搬到当前数据目录
 python aiwf.py context fix-login-npe       # 打包上下文，可直接粘给任何 agent
 
@@ -217,6 +218,7 @@ python aiwf.py gate fix-login-npe          # 检查门禁（失败退出码 2）
 3. **`gate` 退出码非零**，可直接塞进 CI 或 pre-push hook。
 4. **`verify` / `review` 绑定被评审的 commit**——评审或验证之后代码又变了，gate 会拦，**旧结论不能掩盖新代码**。
 5. **`reopen` 归档而不是删除**——需求追加时历史可审计，但旧结论自动不能再当证据。
+6. **验证和评审都看「最新一次」和「时间顺序」**——`verify` 失败不算通过，评审之后又动过代码就算过期。**结论有时效，不是一次性通行证。**
 
 ### 退出码
 
@@ -230,6 +232,7 @@ python aiwf.py gate fix-login-npe          # 检查门禁（失败退出码 2）
 | 5 | link 的 target ts 不存在 |
 | 6 | tracker 号已有 story / 目录已存在 |
 | 7 | 这条 AC 已转交出去，不能在本 story 认领（需先 `undefer`） |
+| 8 | `scan` 发现疑似明文凭据 |
 
 ---
 
