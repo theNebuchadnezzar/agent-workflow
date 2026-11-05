@@ -190,7 +190,8 @@ python aiwf.py init "fix-login-npe" --title "修复登录空指针" --key SHIP-1
 python aiwf.py status [--all]              # 进行中的 story（含"缺几条 AC 没认领"）
 python aiwf.py acs fix-login-npe           # 验收条件与认领情况（含转交、过期认领）
 python aiwf.py where                       # 数据目录在哪、有没有"分裂"
-python aiwf.py scan                        # 扫描明文凭据（可指定目录）
+python aiwf.py scan <目录>                 # 扫描明文凭据（命中退出码 8）
+python aiwf.py scan <目录> --fix --yes     # 拆成脱敏模板 + .local，并自动补 .gitignore
 python aiwf.py adopt [--yes]               # 把仓库内 ./stories 搬到当前数据目录
 python aiwf.py context fix-login-npe       # 打包上下文，可直接粘给任何 agent
 

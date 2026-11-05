@@ -20,6 +20,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -590,7 +591,94 @@ def scan_for_secrets(root, limit=60):
             found.append((str(f), i, key, _mask(val)))
             if len(found) >= limit:
                 return found
+
+        # 账号/密码写在一行的形式（登录账号：user / Passw0rd）
+        for i, line in enumerate(text.splitlines(), 1):
+            if not any(k in line for k in ("账号", "用户名", "登录", "password", "密码")):
+                continue
+            if "/" not in line:
+                continue
+            m2 = re.search(r"[:：]\s*(\S+)\s*/\s*(\S+)", line)
+            if not m2:
+                continue
+            secret = m2.group(2).strip()
+            if len(secret) < 4 or PLACEHOLDER.match(secret):
+                continue
+            found.append((str(f), i, "账号/密码", _mask(secret)))
+            if len(found) >= limit:
+                return found
     return found
+
+
+def _local_name(path):
+    """configs/x.md -> configs/x.local.md"""
+    p = Path(path)
+    if p.suffix:
+        return p.with_name(p.stem + ".local" + p.suffix)
+    return p.with_name(p.name + ".local")
+
+
+def _placeholder(path):
+    if path.suffix.lower() in (".md", ".txt", ".rst"):
+        return "******（真实值见 " + _local_name(path).name + "）"
+    return "CHANGE_ME"
+
+
+def fix_file(path, hits, apply=False):
+    """把命中行里的真实值换成占位，原文另存为 .local。返回 (计划行, 是否已执行)。"""
+    path = Path(path)
+    local = _local_name(path)
+    plan = [f"  {path.name} → 脱敏为模板；真实值存入 {local.name}"]
+    if not apply:
+        return plan, False
+    if local.exists():
+        plan.append(f"    跳过：{local.name} 已存在，不覆盖")
+        return plan, False
+    raw = io.open(path, encoding="utf-8", errors="replace").read()
+    io.open(local, "w", encoding="utf-8", newline="").write(raw)
+
+    lineno_set = {h[1] for h in hits}
+    lines = raw.splitlines(keepends=True)
+    ph = _placeholder(path)
+    out = []
+    for i, line in enumerate(lines, 1):
+        if i in lineno_set:
+            eol = "\n" if line.endswith("\n") else ""
+            m = re.search(r"([A-Za-z0-9_.\-]{2,40})(\s*[:=]\s*)(\S.*?)(\s*)$", line.rstrip("\n"))
+            if m:
+                line = line[:m.start(3)] + ph + m.group(4) + eol
+            else:
+                # 账号/密码写在一行：登录账号：user / Passw0rd
+                m2 = re.search(r"(\s*/\s*)(\S+?)(\s*)$", line.rstrip("\n"))
+                if m2 and any(k in line for k in ("账号", "用户名", "登录", "password")):
+                    line = line[:m2.start(2)] + ph + m2.group(3) + eol
+        out.append(line)
+    io.open(path, "w", encoding="utf-8", newline="").write("".join(out))
+    plan.append(f"    已脱敏 {len(lineno_set)} 行；原文件 {local.name} 保存真实值")
+    return plan, True
+
+
+def _ensure_gitignore(start, rules, apply=False):
+    """在最近的 git 仓库根写 .gitignore 规则。返回 (路径, 新增规则列表)。"""
+    d = Path(start).resolve()
+    root = None
+    for cand in [d] + list(d.parents):
+        if (cand / ".git").exists():
+            root = cand
+            break
+    if root is None:
+        return None, []
+    gi = root / ".gitignore"
+    existing = io.open(gi, encoding="utf-8").read() if gi.exists() else ""
+    need = [r for r in rules if r not in existing.splitlines()]
+    if need and apply:
+        with io.open(gi, "a", encoding="utf-8", newline="") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write("\n# 真实配置（含凭据）不入库\n")
+            for r in need:
+                f.write(r + "\n")
+    return str(gi), need
 
 
 def cmd_scan(args):
@@ -606,6 +694,7 @@ def cmd_scan(args):
         roots = [STORY_DIR]
 
     total = 0
+    by_file = {}
     for root in roots:
         hits = scan_for_secrets(root)
         print(f"扫描  {root}")
@@ -615,13 +704,60 @@ def cmd_scan(args):
         for path, lineno, key, masked in hits:
             rel = path.replace(str(root), ".") if str(root) in path else path
             print(f"  {rel}:{lineno}  {key} = {masked}")
+            by_file.setdefault(path, []).append((path, lineno, key, masked))
         total += len(hits)
-    if total:
-        print(f"\n共 {total} 处疑似明文凭据。")
+
+    if not total:
+        return 0
+
+    print(f"\n共 {total} 处疑似明文凭据。")
+
+    if not args.fix:
         print("  处理：真实值移到环境变量或 .local 文件（不入库），文件里只留变量名；")
         print("        已经提交过的，先轮换凭据再清理历史（清历史不等于失效）。")
+        print("  自动拆分：python aiwf.py scan <路径> --fix   （先预览，加 --yes 执行）")
         return 8
-    return 0
+
+    # ── --fix 模式 ──
+    print("\n拆分计划：")
+    planned = []
+    for path, hits in by_file.items():
+        plan, _ = fix_file(path, hits, apply=False)
+        for line in plan:
+            print(line)
+        planned.append((path, hits))
+
+    rules = ["*.local.md", "*.local.*", "*.local"]
+    gi, need = _ensure_gitignore(Path(list(by_file.keys())[0]).parent, rules, apply=False)
+    if gi:
+        print(f"\n.gitignore：{gi}")
+        if need:
+            for r in need:
+                print(f"  + {r}")
+        else:
+            print("  规则已存在")
+    else:
+        print("\n.gitignore：未找到 git 仓库根，需手动添加：")
+        for r in rules:
+            print(f"  + {r}")
+
+    if not args.yes:
+        print("\n这是预览。确认后加 --yes 执行拆分。")
+        return 8
+
+    print("\n执行：")
+    for path, hits in planned:
+        plan, _ = fix_file(path, hits, apply=True)
+        for line in plan:
+            print(line)
+    if gi and need:
+        _ensure_gitignore(Path(list(by_file.keys())[0]).parent, rules, apply=True)
+        print(f"  已写入 .gitignore：{', '.join(need)}")
+
+    print("\n完成。接下来：")
+    print("  ① git status 确认模板文件已改、.local 文件未被跟踪")
+    print("  ② 若这些凭据曾提交过 git，仍需轮换（清历史不等于失效）")
+    return 8
 
 
 def cmd_where(args):
@@ -1294,6 +1430,8 @@ def main(argv=None):
     p = sub.add_parser("scan", help="扫描明文凭据（默认扫 story 目录，可指定目录）")
     p.add_argument("path", nargs="?", default="", help="要扫描的目录，默认 story 数据目录")
     p.add_argument("--story", default="", help="只扫某个 story 目录")
+    p.add_argument("--fix", action="store_true", help="拆成 .example（脱敏）+ .local（原值）")
+    p.add_argument("--yes", action="store_true", help="配合 --fix 真正执行（默认只预览）")
     p.set_defaults(func=cmd_scan)
 
     p = sub.add_parser("where", help="打印数据目录与统计，排查文件不一致")
