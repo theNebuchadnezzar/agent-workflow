@@ -79,8 +79,12 @@ NEXT_ACTION = {
 META_TMPL = {
     "id": "", "slug": "", "title": "", "stage": "new",
     "created": "", "key": "", "jira": "", "repos": [],
+    "type": "feature", "parents": [], "deferred": {},
     "handoff": {"branch": "", "pr": "", "commit": "", "todo": ""},
 }
+
+STORY_TYPES = ("feature", "bug", "hotfix")
+DEFECT_STATUSES = ("open", "fixed", "verified", "wontfix", "duplicate")
 
 REQ_TMPL = """# 需求：{title}
 
@@ -296,6 +300,67 @@ def _links(d):
             if c.get("kind") == "link" and c.get("target")}
 
 
+def load_defects(d):
+    """读 defects.jsonl 事件流。"""
+    out = []
+    for line in _jsonl_lines(d / "defects.jsonl"):
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def defect_states(d):
+    """把事件流折叠成 {D-1: {状态与最新字段}}。"""
+    state = {}
+    for e in load_defects(d):
+        did = e.get("id")
+        if not did:
+            continue
+        cur = state.setdefault(did, {"id": did, "history": []})
+        cur["history"].append(e)
+        ev = e.get("event")
+        if ev == "open":
+            cur.update(status="open", title=e.get("title", ""),
+                       severity=e.get("severity", "major"), source=e.get("source", "self"),
+                       related_ac=e.get("related_ac", []), repro=e.get("repro", ""),
+                       found_in=e.get("found_in", ""))
+        elif ev == "fix":
+            cur.update(status="fixed", fix_commit=e.get("commit", ""),
+                       fix_note=e.get("note", ""), fix_ts=e.get("ts", ""))
+        elif ev == "verify":
+            if e.get("result") == "pass":
+                cur.update(status="verified", verify_by=e.get("by", ""),
+                           verify_note=e.get("note", ""), verify_ts=e.get("ts", ""))
+            else:
+                cur.update(status="open", verify_by=e.get("by", ""),
+                           verify_note=e.get("note", ""), verify_ts=e.get("ts", ""))
+        elif ev in ("wontfix", "duplicate"):
+            cur.update(status=ev, close_reason=e.get("note", ""))
+    return state
+
+
+def open_defects(d):
+    return {k: v for k, v in defect_states(d).items() if v.get("status") == "open"}
+
+
+def unverified_defects(d):
+    return {k: v for k, v in defect_states(d).items() if v.get("status") == "fixed"}
+
+
+def _defect_append(d, entry):
+    entry.setdefault("ts", now())
+    with (d / "defects.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _next_defect_id(d):
+    ids = [k for k in defect_states(d) if k.startswith("D-")]
+    nums = [int(k[2:]) for k in ids if k[2:].isdigit()]
+    return f"D-{max(nums) + 1 if nums else 1}"
+
+
 def _deferred(d):
     """已转交出去的 AC：{AC id: {reason, owner, at}}"""
     meta = load_meta(d) or {}
@@ -454,8 +519,16 @@ def cmd_init(args):
     d.mkdir(parents=True)
 
     meta = json.loads(json.dumps(META_TMPL))
+    parents = []
+    for pk in (args.parent or []):
+        pd = story_path(pk)
+        if not pd:
+            print(f"WARN：找不到父 story {pk}，仍按文本记录", file=sys.stderr)
+            parents.append(str(pk))
+        else:
+            parents.append((load_meta(pd) or {}).get("key") or pk)
     meta.update(id=d.name, key=key, slug=slug, title=args.title or slug,
-                created=now(), jira=key,
+                created=now(), jira=key, type=args.type, parents=parents,
                 repos=[{"name": r, "path": "", "status": "pending"} for r in (args.repo or [])])
     save_meta(d, meta)
     (d / "requirement.md").write_text(REQ_TMPL.format(**meta), encoding="utf-8")
@@ -466,6 +539,8 @@ def cmd_init(args):
     print(f"created  {d}")
     print(f"id       {d.name}")
     print(f"key      {key or '（无，用当日序号）'}")
+    if args.type != "feature":
+        print(f"type     {args.type}" + (f"　parent={'/'.join(parents)}" if parents else ""))
     print(f"next     {NEXT_ACTION['new']}")
     return 0
 
@@ -538,6 +613,103 @@ def data_dir_report(verbose=False):
 def _print_data_dir(verbose=False):
     for ln in data_dir_report(verbose=verbose):
         print(ln)
+
+
+def cmd_defect(args):
+    """缺陷：open / fix / verify / wontfix / duplicate / list。"""
+    d = _need_story(args.story)
+    if not d:
+        return 1
+    act = args.action
+
+    if act == "list":
+        states = defect_states(d)
+        if not states:
+            print("还没有缺陷记录。")
+            return 0
+        print(f"{'ID':<6}{'严重度':<9}{'来源':<8}{'状态':<10}标题")
+        print("-" * 78)
+        for did in sorted(states, key=lambda k: int(k[2:]) if k[2:].isdigit() else 0):
+            v = states[did]
+            print(f"{did:<6}{v.get('severity','-'):<9}{v.get('source','-'):<8}"
+                  f"{v.get('status','-'):<10}{v.get('title','')}")
+        op = len(open_defects(d))
+        un = len(unverified_defects(d))
+        print(f"\n未修 {op} 个，修了未复测 {un} 个")
+        return 0
+
+    if act == "open":
+        if not args.title:
+            print("ERROR：需要缺陷标题", file=sys.stderr)
+            return 4
+        did = _next_defect_id(d)
+        _defect_append(d, {"event": "open", "id": did, "title": args.title,
+                           "severity": args.severity, "source": args.source,
+                           "related_ac": args.ac or [], "repro": args.repro or "",
+                           "found_in": args.found_in or ""})
+        print(f"defect {did} 已登记：{args.title}")
+        print(f"  严重度 {args.severity}　来源 {args.source}"
+              + (f"　关联 {', '.join(args.ac)}" if args.ac else ""))
+        if not args.repro:
+            print("  提醒：没写复现步骤（--repro），没复现的缺陷等于没提")
+        return 0
+
+    if not args.id:
+        print("ERROR：需要缺陷编号（如 D-1）", file=sys.stderr)
+        return 4
+    states = defect_states(d)
+    if args.id not in states:
+        print(f"ERROR：没有 {args.id} 这个缺陷", file=sys.stderr)
+        print(f"  现有：{', '.join(states) or '（无）'}", file=sys.stderr)
+        return 4
+
+    if act == "fix":
+        if states[args.id].get("status") != "open":
+            print(f"ERROR：{args.id} 当前是 {states[args.id].get('status')}，不是 open",
+                  file=sys.stderr)
+            return 4
+        _defect_append(d, {"event": "fix", "id": args.id,
+                           "commit": args.commit or "", "note": args.note or ""})
+        print(f"defect {args.id} 已标记修复" + (f"（{args.commit}）" if args.commit else ""))
+        # 修完缺陷 = 之前的验收条件对账不再可信 → 归档，强制重做
+        arch = d / "archive"
+        src = d / "ac-check.jsonl"
+        if src.exists():
+            arch.mkdir(exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            shutil.move(str(src), str(arch / f"ac-check.jsonl.{stamp}"))
+            print("  缺陷修复后，上一次对账已归档失效——需要重新 ac-check")
+        return 0
+
+    if act == "verify":
+        if states[args.id].get("status") != "fixed":
+            print(f"ERROR：{args.id} 当前是 {states[args.id].get('status')}，"
+                  "只有 fixed 才能复测", file=sys.stderr)
+            return 4
+        if args.result == "pass" and not args.by:
+            print("ERROR：复测通过必须写 --by（谁复测的）。修复者不能自证。",
+                  file=sys.stderr)
+            return 4
+        _defect_append(d, {"event": "verify", "id": args.id,
+                           "result": args.result, "by": args.by or "",
+                           "note": args.note or ""})
+        if args.result == "pass":
+            print(f"defect {args.id} 复测通过，关闭")
+        else:
+            print(f"defect {args.id} 复测未通过，退回 open")
+        return 0
+
+    if act in ("wontfix", "duplicate"):
+        if not (args.reason or getattr(args, "note", "")):
+            print(f"ERROR：{act} 必须写 --reason 说明原因", file=sys.stderr)
+            return 4
+        _defect_append(d, {"event": act, "id": args.id,
+                           "note": args.reason or getattr(args, "note", "")})
+        print(f"defect {args.id} 标记为 {act}")
+        return 0
+
+    print(f"ERROR：未知动作 {act}", file=sys.stderr)
+    return 4
 
 
 def _mask(value):
@@ -847,17 +1019,19 @@ def cmd_status(args):
         missing = len(unclaimed_acs(d))
         created = str(meta.get("created", ""))[:10] or "-"
         show_key = meta.get("key") or meta.get("jira") or "-"
+        n_df = len(open_defects(d))
         rows.append((created, show_key, stage, last + mark,
                      f"{missing}" if missing else "-",
-                     len(load_changes(d)), meta.get("title", ""), meta.get("slug", "")))
+                     len(load_changes(d)), str(n_df) if n_df else "-",
+                     meta.get("title", ""), meta.get("slug", "")))
     if not rows:
         print("没有进行中的 story（加 --all 看已完成）。")
         return 0
-    print(f"{'DATE':<12}{'KEY':<13}{'STAGE':<13}{'AC':>4}{'缺':>4}{'CHG':>4}  TITLE")
-    print("-" * 92)
-    for created, key, stage, last, miss, n, title, slug in rows:
+    print(f"{'DATE':<12}{'KEY':<13}{'STAGE':<13}{'AC':>4}{'缺':>4}{'CHG':>4}{'缺陷':>5}  TITLE")
+    print("-" * 96)
+    for created, key, stage, last, miss, n, ndf, title, slug in rows:
         label = title or slug
-        print(f"{created:<12}{key:<13}{stage:<13}{last:>4}{miss:>4}{n:>4}  {label}")
+        print(f"{created:<12}{key:<13}{stage:<13}{last:>4}{miss:>4}{n:>4}{ndf:>5}  {label}")
     print("\nAC: 最近一次兑现检查 pass / warn(!) / block(x) / -（还没查）")
     print("缺: 还没有改动认领的验收条件数量")
     print()
@@ -1311,7 +1485,13 @@ def cmd_gate(args):
         if not _plan_has_rows(read_text(d, "plan.md")):
             problems.append("plan.md：「改哪些文件」表还是空模板")
 
-    if rank >= 3:                                   # implementing 起：对账
+    if rank >= 4:                                   # verifying 起：缺陷必须修
+        op = open_defects(d)
+        if op:
+            names = ", ".join(f"{k}({v.get('severity')})" for k, v in op.items())
+            problems.append(f"defects.jsonl：还有 {len(op)} 个缺陷没修：{names}")
+
+
         changes = load_changes(d)
         if not changes:
             problems.append("changes.jsonl：还没有任何改动记录")
@@ -1373,7 +1553,13 @@ def cmd_gate(args):
             elif not vc:
                 hints.append("verify.json 没记验证的 commit，建议 verify --commit <sha>")
 
-    if rank >= 6:                                   # reviewed 起
+    if rank >= 6:                                   # reviewed 起：缺陷必须复测
+        un = unverified_defects(d)
+        if un:
+            problems.append("defects.jsonl：这些缺陷修了但没复测（等于没修）："
+                            + ", ".join(un))
+
+
         r = _load_json(d / "review.json")
         if r == "INVALID":
             problems.append("review.json：不是合法 JSON")
@@ -1425,6 +1611,10 @@ def main(argv=None):
     p.add_argument("--repo", action="append")
     p.add_argument("--key", "--jira", dest="key", default="",
                    help="tracker 号：Jira SHIP-1024 / GitHub #123 / 禅道 等")
+    p.add_argument("--type", dest="type", default="feature", choices=list(STORY_TYPES),
+                   help="feature（需求）/ bug（缺陷单）/ hotfix（线上急修）")
+    p.add_argument("--parent", action="append",
+                   help="关联的上游 story key（bug 单常用：--parent SHIP-1024）")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("scan", help="扫描明文凭据（默认扫 story 目录，可指定目录）")
@@ -1433,6 +1623,50 @@ def main(argv=None):
     p.add_argument("--fix", action="store_true", help="拆成 .example（脱敏）+ .local（原值）")
     p.add_argument("--yes", action="store_true", help="配合 --fix 真正执行（默认只预览）")
     p.set_defaults(func=cmd_scan)
+
+    dp = sub.add_parser("defect", help="缺陷管理：open / fix / verify / wontfix / list")
+    dsub = dp.add_subparsers(dest="action", required=True)
+
+    q = dsub.add_parser("open", help="登记缺陷")
+    q.add_argument("story")
+    q.add_argument("title")
+    q.add_argument("--severity", default="major", choices=["blocker", "major", "minor"])
+    q.add_argument("--source", default="self", choices=["self", "SIT", "review", "prod"])
+    q.add_argument("--ac", action="append", help="关联的验收条件，如 AC-1")
+    q.add_argument("--repro", default="", help="复现步骤：期望 vs 实际")
+    q.add_argument("--found-in", default="", help="在哪个提交上发现的")
+    q.set_defaults(func=cmd_defect)
+
+    q = dsub.add_parser("fix", help="标记已修")
+    q.add_argument("story")
+    q.add_argument("id")
+    q.add_argument("--commit", default="")
+    q.add_argument("--note", default="", help="根因")
+    q.set_defaults(func=cmd_defect)
+
+    q = dsub.add_parser("verify", help="复测（必须换人）")
+    q.add_argument("story")
+    q.add_argument("id")
+    q.add_argument("--result", required=True, choices=["pass", "fail"])
+    q.add_argument("--by", default="", help="谁复测的（pass 时必填）")
+    q.add_argument("--note", default="")
+    q.set_defaults(func=cmd_defect)
+
+    q = dsub.add_parser("wontfix", help="不修（需原因）")
+    q.add_argument("story")
+    q.add_argument("id")
+    q.add_argument("--reason", default="")
+    q.set_defaults(func=cmd_defect)
+
+    q = dsub.add_parser("duplicate", help="重复缺陷")
+    q.add_argument("story")
+    q.add_argument("id")
+    q.add_argument("--reason", default="")
+    q.set_defaults(func=cmd_defect)
+
+    q = dsub.add_parser("list", help="缺陷清单")
+    q.add_argument("story")
+    q.set_defaults(func=cmd_defect)
 
     p = sub.add_parser("where", help="打印数据目录与统计，排查文件不一致")
     p.set_defaults(func=cmd_where)

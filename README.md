@@ -45,6 +45,7 @@
     plan.md                         # 实施方案：改哪些文件、为什么
     changes.jsonl                   # 每次改动一行；每条挂它兑现的 AC
     ac-check.jsonl                  # 验收条件兑现检查（可多次）
+    defects.jsonl                   # 缺陷事件流（open/fix/verify/wontfix）
     verify.json                     # 自检：编译/测试结果
     review.json                     # 独立评审结论（必须换 session）
     archive/                        # reopen 时归档的旧 verify/review/ac-check（留档但失效）
@@ -85,8 +86,8 @@ new → clarifying → planned → implementing → verifying → reviewing → 
 | clarifying 起 | 澄清问答非空，且**验收条件至少有一条 `- [ ] 实质内容`**（空复选框不算） |
 | planned 起 | plan.md 的「改哪些文件」表有真实数据行 |
 | implementing 起 | changes 至少一条；**每条 code/test 改动都挂了 AC**；**每条 AC 都有人认领**（转交的除外）；**AC 文本改过的旧认领不算数**；最近一次 ac-check 不是 `block` |
-| verifying 起 | **必须做过一次 ac-check（pass/warn）**；**verify 最近一次结果必须是 `pass`**；**若 verify 记了 `commit`，必须与 handoff 的提交一致** |
-| reviewed 起 | review.json 存在、`independent=true`、`verdict=pass`；**若 review 记了 `commit`，必须与 handoff 的提交一致**；**评审之后不能再有 code/test 改动**（否则评审过期，要重评） |
+| verifying 起 | **不能有未修（open）的缺陷**；**必须做过一次 ac-check（pass/warn）**；**verify 最近一次结果必须是 `pass`**；**若 verify 记了 `commit`，必须与 handoff 的提交一致** |
+| reviewed 起 | **不能有「修了但没复测」的缺陷**；review.json 存在、`independent=true`、`verdict=pass`；**若 review 记了 `commit`，必须与 handoff 的提交一致**；**评审之后不能再有 code/test 改动**（否则评审过期，要重评） |
 
 ---
 
@@ -202,6 +203,11 @@ python aiwf.py handoff fix-login-npe --branch fix/npe --pr 128 --commit abc1234 
         --todo "补一条空值回归用例"          # 交接指针：给指针，不复制历史
 python aiwf.py ac-check fix-login-npe > ac-prompt.md   # 生成对账提示词
 python aiwf.py ac-record fix-login-npe --verdict pass --fulfilled AC-1 --fulfilled AC-2
+python aiwf.py defect open fix-login-npe "日志级别写错" --severity minor --source review \\
+        --ac AC-2 --repro "导出日志应为 warn，实际 info"
+python aiwf.py defect fix fix-login-npe D-1 --commit abc1234 --note "根因：常量写错"
+python aiwf.py defect verify fix-login-npe D-1 --result pass --by tester-a
+python aiwf.py defect list fix-login-npe
 python aiwf.py defer fix-login-npe AC-3 --owner frontend --reason "前端仓库负责"  # 转交 AC
 python aiwf.py undefer fix-login-npe AC-3   # 把转交的 AC 拿回来
 python aiwf.py reopen fix-login-npe --reason "追加需求"   # 退回 clarifying，旧结论失效
