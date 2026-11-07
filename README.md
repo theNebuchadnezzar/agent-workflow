@@ -196,6 +196,7 @@ python aiwf.py init "fix-login-npe" --title "修复登录空指针" --key SHIP-1
 python aiwf.py status [--all]              # 进行中的 story（含"缺几条 AC 没认领"）
 python aiwf.py acs fix-login-npe           # 验收条件与认领情况（含转交、过期认领）
 python aiwf.py where                       # 数据目录在哪、有没有"分裂"
+python aiwf.py selftest                     # 端到端自检（改门禁后必跑）
 python aiwf.py scan <目录>                 # 扫描明文凭据（命中退出码 8）
 python aiwf.py scan <目录> --fix --yes     # 拆成脱敏模板 + .local，并自动补 .gitignore
 python aiwf.py adopt [--yes]               # 把仓库内 ./stories 搬到当前数据目录
@@ -313,6 +314,36 @@ python aiwf.py adopt     # 把仓库内 ./stories 搬到当前数据目录（先
 | 真实项目验证 | 一个真实 Jira 单跑完 clarifying → reviewed（含前后端分工与需求追加） | ✅ |
 | v2 | `verify` 自动跑命令；`status` 显示 token/成本 | 待做 |
 | v3 | watchdog 自动化（headless agent 直接跑 ac-check） | 待做 |
+
+---
+
+## 开发注意事项
+
+### 改门禁或状态机，先跑自检
+
+`bash
+python aiwf.py selftest
+`
+
+21 个断言，在临时目录里跑完整流程，逐阶段验证拦截行为：未挂 AC、AC 未认领、
+AC 改写后旧认领失效、verify 失败、commit 变更后验证过期、有 open 缺陷、
+缺陷没复测、复测不写 --by、评审后改动、非法阶段、阻塞、reopen。
+
+**为什么会有这条规矩**：连续三次回归都是自伤——
+
+| 事故 | 怎么发生的 |
+|---|---|
+| implementing 阶段门禁被吞 | 用字符串锚点插入 `if rank >= 4:` 块时，把 `if rank >= 3:` 那行替换掉了，四条检查被并进了 verifying |
+| `wontfix` 崩溃 | 新命令引用 `args.note`，但那个子命令没定义 `--note` |
+| `blocked` 静默无效 | `record --stage blocked` 打印"成功"，但不在 STAGES 里所以阶段根本没变 |
+
+**共同原因**：用脚本批量替换代码、靠字符串锚点改结构。**改完必须跑自检，不能等下一个功能做完才发现。**
+
+### 另外三条
+
+- **改完看 diff 的缩进**：字符串替换最容易吃掉 `if`/`for` 这一行，导致整块被并进上一个分支。
+- **测试用临时目录**：`selftest` 自己在工作区建 `.selftest-<随机>`，跑完删除；不要拿真实 story 试。
+- **文档跟代码一起改**：状态机图、门禁表、退出码，这三处最容易漂移（`blocked` 就是文档写了、代码没有）。
 
 ---
 

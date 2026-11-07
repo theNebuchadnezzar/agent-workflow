@@ -615,6 +615,170 @@ def _print_data_dir(verbose=False):
         print(ln)
 
 
+def cmd_selftest(args):
+    """端到端自检：在临时目录里跑一遍完整流程，逐阶段验证门禁。
+
+    改门禁/状态机之后必须先跑这个——历史上三次回归都是靠它才发现的。
+    """
+    import subprocess
+    import uuid
+
+    script = str(Path(__file__).resolve())
+    # 建在工作区内，且用普通 mkdir：mkdtemp 建出的目录在受限环境下可能不可列举
+    tmp_path = ROOT / (".selftest-" + uuid.uuid4().hex[:8])
+    tmp_path.mkdir(parents=True, exist_ok=False)
+    tmp = str(tmp_path)
+    env = dict(os.environ)
+    env["AIWF_DATA"] = tmp
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    def run(*argv):
+        r = subprocess.run([sys.executable, script, *argv],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", env=env, timeout=60)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+    cases = []
+
+    def case(name, ok, detail=""):
+        cases.append((name, ok, detail))
+        mark = "PASS" if ok else "FAIL"
+        line = f"  [{mark}] {name}"
+        if not ok and detail:
+            line += f"\n         {detail.strip().splitlines()[0][:110] if detail.strip() else ''}"
+        print(line)
+
+    def write_story(slug, acs):
+        d = Path(tmp) / slug
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "requirement.md").write_text(
+            "## 澄清问答\n- Q: a A: b\n\n## 验收条件\n" + acs + "\n", encoding="utf-8")
+        (d / "plan.md").write_text(
+            "## 改哪些文件\n| repo | 文件 | 改什么 | 为什么 |\n|---|---|---|---|\n"
+            "| r | a.java | x | y |\n", encoding="utf-8")
+        (d / "changes.jsonl").write_text("", encoding="utf-8")
+        return d.name
+
+    try:
+        # ── 准备 ──
+        code, out = run("init", "self", "--key", "ST-1", "--title", "自检")
+        case("init 成功", code == 0, out)
+
+        name = None
+        for cand in sorted(Path(tmp).iterdir()):
+            if cand.is_dir():
+                name = cand.name
+                break
+        case("story 目录已创建", name is not None)
+
+        write_story(name, "- [ ] AC-1 甲\n- [ ] AC-2 乙")
+
+        code, out = run("gate", "ST-1")
+        case("new 阶段门禁通过", code == 0, out)
+
+        # ── implementing：挂 AC 检查 ──
+        code, out = run("record", "ST-1", "--stage", "implementing", "--file", "a.java")
+        code, out = run("gate", "ST-1")
+        case("implementing 未挂 AC 被拦", code == 2 and "没挂验收条件" in out, out)
+
+        # 把刚才那笔漏挂 AC 的改动补挂掉，否则它会一直让 gate 红（这是正确行为）
+        import json as _json
+        ch = (Path(tmp) / name / "changes.jsonl").read_text(encoding="utf-8").splitlines()
+        stray = [_json.loads(x) for x in ch if x.strip()]
+        stray_ts = [c["ts"] for c in stray if not c.get("criteria")]
+        if stray_ts:
+            run("link", "ST-1", "--target", stray_ts[-1], "--criterion", "AC-1")
+
+        code, out = run("record", "ST-1", "--file", "a2.java", "--criterion", "AC-1", "--why", "x")
+        code, out = run("gate", "ST-1")
+        case("AC-2 未认领被拦", code == 2 and "AC-2" in out, out)
+
+        code, out = run("record", "ST-1", "--file", "b.java", "--criterion", "AC-2", "--why", "y")
+        code, out = run("gate", "ST-1")
+        case("全部认领后 implementing 通过", code == 0, out)
+
+        # ── AC 版本绑定 ──
+        req = Path(tmp) / name / "requirement.md"
+        req.write_text(req.read_text(encoding="utf-8").replace(
+            "AC-1 甲", "AC-1 甲（改写）"), encoding="utf-8")
+        code, out = run("gate", "ST-1")
+        case("AC 改写后旧认领失效被拦", code == 2 and "旧认领已失效" in out, out)
+        run("record", "ST-1", "--file", "a3.java", "--criterion", "AC-1", "--why", "重认领")
+        code, out = run("gate", "ST-1")
+        case("重新认领后恢复", code == 0, out)
+
+        # ── verify 结果 ──
+        run("ac-record", "ST-1", "--verdict", "pass", "--fulfilled", "AC-1", "--fulfilled", "AC-2")
+        run("record", "ST-1", "--stage", "verifying", "--kind", "note", "--note", "s")
+        run("verify", "ST-1", "--cmd", "mvn t", "--result", "fail", "--commit", "c1")
+        run("handoff", "ST-1", "--commit", "c1")
+        code, out = run("gate", "ST-1")
+        case("verify 失败被拦", code == 2 and "不是 pass" in out, out)
+
+        run("verify", "ST-1", "--cmd", "mvn t", "--result", "pass", "--commit", "c1")
+        code, out = run("gate", "ST-1")
+        case("verify 通过后 verifying 通过", code == 0, out)
+
+        # ── commit 绑定 ──
+        run("handoff", "ST-1", "--commit", "c2")
+        code, out = run("gate", "ST-1")
+        case("代码变了旧 verified 过期被拦", code == 2 and "代码变了" in out, out)
+        run("handoff", "ST-1", "--commit", "c1")
+
+        # ── 缺陷 ──
+        run("defect", "open", "ST-1", "缺陷甲", "--severity", "major")
+        code, out = run("gate", "ST-1")
+        case("有 open 缺陷被拦", code == 2 and "没修" in out, out)
+
+        run("defect", "fix", "ST-1", "D-1", "--commit", "c1")
+        code, out = run("gate", "ST-1")
+        case("修缺陷后对账失效被拦", code == 2 and "兑现检查" in out, out)
+
+        run("ac-record", "ST-1", "--verdict", "pass", "--fulfilled", "AC-1", "--fulfilled", "AC-2")
+        run("review", "ST-1", "--independent", "--verdict", "pass", "--commit", "c1")
+        code, out = run("gate", "ST-1")
+        case("缺陷修了没复测被拦", code == 2 and "没复测" in out, out)
+
+        code, out = run("defect", "verify", "ST-1", "D-1", "--result", "pass")
+        case("复测不写 --by 被拒", code == 4, out)
+
+        run("defect", "verify", "ST-1", "D-1", "--result", "pass", "--by", "tester")
+        code, out = run("gate", "ST-1")
+        case("复测后 reviewed 通过", code == 0, out)
+
+        # ── 评审后改动 ──
+        run("record", "ST-1", "--file", "c.java", "--criterion", "AC-1", "--why", "评审后又改")
+        code, out = run("gate", "ST-1")
+        case("评审后改动被拦", code == 2 and "评审已过期" in out, out)
+
+        # ── 阶段校验 / 阻塞 / reopen ──
+        code, out = run("record", "ST-1", "--stage", "blocked")
+        case("非法阶段被拒", code == 4, out)
+
+        run("record", "ST-1", "--blocked", "等口径", "--kind", "note")
+        code, out = run("gate", "ST-1")
+        case("阻塞只提示不拦", "处于阻塞" in out, out)
+
+        code, out = run("reopen", "ST-1", "--reason", "追加")
+        case("reopen 回到 clarifying", code == 0 and "clarifying" in out, out)
+        code, out = run("gate", "ST-1")
+        case("reopen 后旧评审不再算数", code == 0, out)
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    failed = [c for c in cases if not c[1]]
+    print()
+    print(f"自检：{len(cases) - len(failed)}/{len(cases)} 通过")
+    if failed:
+        print("失败项：")
+        for name, _, _ in failed:
+            print("  -", name)
+        return 1
+    print("全部通过。")
+    return 0
+
+
 def cmd_defect(args):
     """缺陷：open / fix / verify / wontfix / duplicate / list。"""
     d = _need_story(args.story)
@@ -1645,6 +1809,9 @@ def main(argv=None):
     p.add_argument("--parent", action="append",
                    help="关联的上游 story key（bug 单常用：--parent SHIP-1024）")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("selftest", help="端到端自检（改门禁后必跑）")
+    p.set_defaults(func=cmd_selftest)
 
     p = sub.add_parser("scan", help="扫描明文凭据（默认扫 story 目录，可指定目录）")
     p.add_argument("path", nargs="?", default="", help="要扫描的目录，默认 story 数据目录")
