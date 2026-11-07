@@ -57,10 +57,15 @@
 
 ```
 new → clarifying → planned → implementing → verifying → reviewing → reviewed → done
-         ↓              ↓            ↓            ↓          ↓
-      blocked        blocked      blocked      failed    打回 implementing
+                                                    ↑                        │
+                                                    └──── review fail ───────┘
+
+任意阶段 ──(被卡住)──→ 打 ⏸ 标记（不是阶段，解除后回到原阶段）
 ```
 
+> **`blocked` 是标记，不是阶段**：`record --blocked "等需求方"` 只打标记——`status` 显示 `⏸`、`context` 带原因、`gate` 给提示，**阶段不变**。
+> 理由：被卡住是**原因**，不是**进度**；做成阶段会让「这个 story 到底在实施还是被卡住」变成二选一。
+>
 > **`reopen` 可以从任意阶段退回 `clarifying`**（需求追加时用）：旧的 `verify` / `review` / `ac-check` 会移到 `archive/` 归档失效，历史保留但不能再当证据。
 
 ### 三个检查点，各管一段
