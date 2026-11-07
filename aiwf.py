@@ -1491,7 +1491,7 @@ def cmd_gate(args):
             names = ", ".join(f"{k}({v.get('severity')})" for k, v in op.items())
             problems.append(f"defects.jsonl：还有 {len(op)} 个缺陷没修：{names}")
 
-
+    if rank >= 3:                                   # implementing 起：改动与认领
         changes = load_changes(d)
         if not changes:
             problems.append("changes.jsonl：还没有任何改动记录")
