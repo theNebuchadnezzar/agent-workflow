@@ -79,7 +79,7 @@ NEXT_ACTION = {
 META_TMPL = {
     "id": "", "slug": "", "title": "", "stage": "new",
     "created": "", "key": "", "jira": "", "repos": [],
-    "type": "feature", "parents": [], "deferred": {},
+    "type": "feature", "parents": [], "deferred": {}, "blocked": {},
     "handoff": {"branch": "", "pr": "", "commit": "", "todo": ""},
 }
 
@@ -1020,6 +1020,8 @@ def cmd_status(args):
         created = str(meta.get("created", ""))[:10] or "-"
         show_key = meta.get("key") or meta.get("jira") or "-"
         n_df = len(open_defects(d))
+        if meta.get("blocked"):
+            stage = stage + "⏸"
         rows.append((created, show_key, stage, last + mark,
                      f"{missing}" if missing else "-",
                      len(load_changes(d)), str(n_df) if n_df else "-",
@@ -1034,6 +1036,7 @@ def cmd_status(args):
         print(f"{created:<12}{key:<13}{stage:<13}{last:>4}{miss:>4}{n:>4}{ndf:>5}  {label}")
     print("\nAC: 最近一次兑现检查 pass / warn(!) / block(x) / -（还没查）")
     print("缺: 还没有改动认领的验收条件数量")
+    print("⏸ : 已标记阻塞（原因见 context）")
     print()
     _print_data_dir()
     return 0
@@ -1125,6 +1128,12 @@ def cmd_context(args):
             out.append(f"- 问题：{it}")
         out.append("")
 
+    if meta.get("blocked"):
+        b = meta["blocked"]
+        out += ["## 阻塞中", "", f"- 原因：{b.get('reason') or '-'}",
+                f"- 自：{b.get('since') or '-'}",
+                "- 解除：python aiwf.py record <story> --unblocked", ""]
+
     out += ["## 你现在要做的事", "", NEXT_ACTION.get(meta.get("stage", "new"), "")]
     print("\n".join(out))
     return 0
@@ -1136,6 +1145,12 @@ def cmd_record(args):
         return 1
     meta = load_meta(d) or {}
     stage = args.stage or meta.get("stage")
+
+    if args.stage and args.stage not in STAGES:
+        print(f"ERROR：没有这个阶段：{args.stage}", file=sys.stderr)
+        print(f"  可用：{', '.join(STAGES)}", file=sys.stderr)
+        print("  被卡住（等需求方/等依赖）用 --blocked，那不是阶段。", file=sys.stderr)
+        return 4
 
     crits = {c["id"]: c for c in parse_criteria(read_text(d, "requirement.md"))}
     given = args.criterion or []
@@ -1164,6 +1179,16 @@ def cmd_record(args):
              "why": args.why or "", "note": args.note or ""}
     with (d / "changes.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    if args.blocked:
+        meta["blocked"] = {"reason": args.blocked, "since": now()}
+        save_meta(d, meta)
+        print(f"  已标记阻塞：{args.blocked}")
+        print("  解除：python aiwf.py record <story> --unblocked")
+    if args.unblocked and meta.get("blocked"):
+        prev = meta.pop("blocked") or {}
+        save_meta(d, meta)
+        print(f"  已解除阻塞（原原因：{prev.get('reason') or '-'}）")
 
     if args.stage and args.stage in STAGES and args.stage != meta.get("stage"):
         meta["stage"] = args.stage
@@ -1469,6 +1494,10 @@ def cmd_gate(args):
     problems = []
     hints = []
 
+    if meta.get("blocked"):
+        b = meta["blocked"]
+        hints.append(f"story 处于阻塞（{b.get('since','?')}）：{b.get('reason') or '-'}")
+
     sec = scan_for_secrets(d, limit=5)
     if sec:
         hints.append(f"story 目录里有 {len(sec)} 处疑似明文凭据（如 {sec[0][2]}），"
@@ -1696,6 +1725,8 @@ def main(argv=None):
     p.add_argument("--why", default="", help="为什么这处改动能兑现它")
     p.add_argument("--kind", default="code", choices=["code", "test", "doc", "config", "note"])
     p.add_argument("--note", default="")
+    p.add_argument("--blocked", default="", help="标记被卡住（写原因），不进阶段机")
+    p.add_argument("--unblocked", action="store_true", help="解除阻塞")
     p.set_defaults(func=cmd_record)
 
     p = sub.add_parser("defer", help="把部分 AC 转交给别处（前端 / 另一组件），不再要求本 story 认领")
